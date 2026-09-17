@@ -7,3 +7,5 @@ pandas
 pymongo
 scikit-learn
 python-dotenv
+anthropic
+python-multipart
