@@ -83,6 +83,48 @@ def load_json(path: Path) -> dict[str, Any]:
         return json.load(f)
 
 
+def validate_database_docs(payload: dict[str, Any], database: str) -> None:
+    """Validate the small JSON contract consumed by the RAG index."""
+    database = database.lower()
+    if not isinstance(payload, dict):
+        raise ValueError("Database documentation must be a JSON object")
+    if database == "sqlite":
+        items = payload.get("tables")
+        item_label = "tables"
+        child_label = "columns"
+    elif database == "mongodb":
+        items = payload.get("collections")
+        item_label = "collections"
+        child_label = "fields"
+    else:
+        raise ValueError(f"Unsupported database documentation type: {database}")
+    if not isinstance(items, list):
+        raise ValueError(f"Database documentation must contain a '{item_label}' array")
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not item["name"].strip():
+            raise ValueError(f"Each {item_label[:-1]} must have a non-empty 'name'")
+        children = item.get(child_label, [])
+        if not isinstance(children, list):
+            raise ValueError(f"'{child_label}' must be an array")
+        for child in children:
+            if not isinstance(child, dict) or not isinstance(child.get("name"), str) or not child["name"].strip():
+                raise ValueError(f"Each {child_label[:-1]} must have a non-empty 'name'")
+
+
+def validate_mappings(payload: dict[str, Any]) -> None:
+    if not isinstance(payload, dict) or not isinstance(payload.get("mappings"), list):
+        raise ValueError("Mappings must be a JSON object containing a 'mappings' array")
+    for mapping in payload["mappings"]:
+        if not isinstance(mapping, dict) or not mapping.get("entity"):
+            raise ValueError("Each mapping must contain an 'entity'")
+        sqlite = mapping.get("sqlite")
+        mongo = mapping.get("mongodb", mapping.get("mongo"))
+        if not isinstance(sqlite, dict) or not sqlite.get("table") or not sqlite.get("key"):
+            raise ValueError("Each mapping.sqlite must contain 'table' and 'key'")
+        if not isinstance(mongo, dict) or not mongo.get("collection") or not mongo.get("key"):
+            raise ValueError("Each mapping.mongodb must contain 'collection' and 'key'")
+
+
 def load_database_docs(database: str) -> dict[str, Any]:
     path = SQLITE_DOCS if database.lower() == "sqlite" else MONGO_DOCS
     return load_json(path)
@@ -196,7 +238,7 @@ def get_rag() -> DatabaseRAG:
 
 
 def save_upload(filename: str, content: bytes, target: str) -> Path:
-    """Save a user upload into the active DataTalk workspace.
+    """Save and validate a user upload into the active DataTalk workspace.
 
     target: sqlite-db | sqlite-docs | mongodb-docs | mappings
     """
@@ -215,6 +257,29 @@ def save_upload(filename: str, content: bytes, target: str) -> Path:
     suffix = Path(safe_name).suffix.lower()
     if suffix not in allowed:
         raise ValueError(f"Unsupported file type for {target}: {suffix}")
+
+    if target == "sqlite-db":
+        try:
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
+                tmp.write(content)
+                tmp.flush()
+                with sqlite3.connect(tmp.name) as conn:
+                    conn.execute("PRAGMA schema_version").fetchone()
+        except sqlite3.Error as exc:
+            raise ValueError(f"Invalid SQLite database: {exc}") from exc
+    elif target in {"sqlite-docs", "mongodb-docs", "mappings"}:
+        try:
+            payload = json.loads(content.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid JSON file: {exc}") from exc
+        if target == "sqlite-docs":
+            validate_database_docs(payload, "sqlite")
+        elif target == "mongodb-docs":
+            validate_database_docs(payload, "mongodb")
+        else:
+            validate_mappings(payload)
+
     directory.mkdir(parents=True, exist_ok=True)
     if target == "sqlite-db":
         destination = SQLITE_DB
@@ -241,6 +306,25 @@ def workspace_status() -> dict[str, Any]:
         "claude_configured": bool(os.getenv("CLAUDE_API_KEY")),
         "claude_model": os.getenv("CLAUDE_MODEL", "claude-sonnet-5"),
     }
+
+
+def sqlite_schema(db_path: str | Path = SQLITE_DB) -> list[dict[str, Any]]:
+    """Return SQLite table/column metadata for agents and diagnostics."""
+    with sqlite3.connect(str(db_path)) as conn:
+        tables = [row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()]
+        result = []
+        for table in tables:
+            columns = conn.execute(f'PRAGMA table_info("{table.replace(chr(34), chr(34) + chr(34))}")').fetchall()
+            result.append({
+                "table": table,
+                "columns": [
+                    {"name": row[1], "type": row[2], "nullable": not bool(row[3]), "primary_key": bool(row[5])}
+                    for row in columns
+                ],
+            })
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +364,7 @@ def merge_on_key(left: Iterable[dict[str, Any]], right: Iterable[dict[str, Any]]
     right_df = pd.DataFrame(list(right))
     if left_df.empty or right_df.empty:
         return []
-    merged = left_df.merge(right_df, left_on=left_key, right_on=right_key,
+    merged = left_df.merge(left_df if False else right_df, left_on=left_key, right_on=right_key,
                            how=how, suffixes=("_sql", "_mongo"))
     return merged.where(pd.notna(merged), None).to_dict(orient="records")
 
