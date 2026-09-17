@@ -27,10 +27,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 class QueryRequest(BaseModel):
     question: str
 
+
 _graph = None
+
 
 def get_graph() -> Any:
     global _graph
@@ -42,9 +45,11 @@ def get_graph() -> Any:
         _graph = build_graph()
     return _graph
 
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {"status": "ok", "workspace": workspace_status()}
+
 
 @app.post("/query")
 def query(payload: QueryRequest) -> dict[str, Any]:
@@ -65,6 +70,61 @@ def query(payload: QueryRequest) -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+
+@app.post("/upload/mongodb-data")
+async def upload_mongodb_data(file: UploadFile = File(...)) -> dict[str, Any]:
+    """Import a JSON MongoDB export into the configured MongoDB database.
+
+    Accepted shape: {"collection_name": [{...}, {...}], ...}.
+    This keeps MongoDB server-side while allowing the web UI to load test data.
+    """
+    try:
+        from pymongo import MongoClient
+
+        filename = file.filename or "upload.json"
+        if not filename.lower().endswith(".json"):
+            raise ValueError("MongoDB data upload must be a .json file")
+        payload = json.loads((await file.read()).decode("utf-8"))
+        if not isinstance(payload, dict) or not payload:
+            raise ValueError("MongoDB upload must be a non-empty JSON object mapping collection names to arrays")
+
+        client = MongoClient(
+            os.getenv("MONGO_URI", "mongodb://localhost:27017"),
+            serverSelectionTimeoutMS=3000,
+        )
+        db = client[os.getenv("MONGO_DB", "datatalk")]
+        imported = 0
+        collections = 0
+        try:
+            for collection_name, documents in payload.items():
+                if not isinstance(collection_name, str) or not collection_name.strip():
+                    raise ValueError("MongoDB collection names must be non-empty strings")
+                if not isinstance(documents, list):
+                    raise ValueError(f"Collection '{collection_name}' must contain an array")
+                if any(not isinstance(document, dict) for document in documents):
+                    raise ValueError(f"Collection '{collection_name}' must contain JSON objects")
+
+                db[collection_name].delete_many({})
+                if documents:
+                    db[collection_name].insert_many(documents)
+                imported += len(documents)
+                collections += 1
+        finally:
+            client.close()
+
+        return {
+            "ok": True,
+            "target": "mongodb-data",
+            "collections_imported": collections,
+            "documents_imported": imported,
+            "workspace": workspace_status(),
+        }
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"MongoDB import failed: {exc}") from exc
+
+
 @app.post("/upload/{target}")
 async def upload(target: str, file: UploadFile = File(...)) -> dict[str, Any]:
     allowed = {"sqlite-db", "sqlite-docs", "mongodb-docs", "mappings"}
@@ -73,42 +133,17 @@ async def upload(target: str, file: UploadFile = File(...)) -> dict[str, Any]:
     try:
         content = await file.read()
         destination = save_upload(file.filename or "upload", content, target)
-        return {"ok": True, "target": target, "filename": destination.name, "workspace": workspace_status()}
+        return {
+            "ok": True,
+            "target": target,
+            "filename": destination.name,
+            "workspace": workspace_status(),
+        }
     except (ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-@app.post("/upload/mongodb-data")
-async def upload_mongodb_data(file: UploadFile = File(...)) -> dict[str, Any]:
-    """Import a JSON MongoDB export into the configured MongoDB database.
-
-    Accepted shape: {"collection_name": [{...}, {...}], ...}.
-    This keeps MongoDB server-side while still allowing the web UI to load data.
-    """
-    try:
-        from pymongo import MongoClient
-        payload = json.loads((await file.read()).decode("utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("MongoDB upload must be a JSON object mapping collection names to arrays")
-        client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"), serverSelectionTimeoutMS=3000)
-        db = client[os.getenv("MONGO_DB", "datatalk")]
-        imported = 0
-        try:
-            for collection_name, documents in payload.items():
-                if not isinstance(documents, list):
-                    raise ValueError(f"Collection '{collection_name}' must contain an array")
-                if documents:
-                    db[collection_name].delete_many({})
-                    db[collection_name].insert_many(documents)
-                    imported += len(documents)
-        finally:
-            client.close()
-        return {"ok": True, "target": "mongodb-data", "documents_imported": imported, "workspace": workspace_status()}
-    except (ValueError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"MongoDB import failed: {exc}") from exc
 
 @app.post("/claude/test")
 def claude_test() -> dict[str, str]:
