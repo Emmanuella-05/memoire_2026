@@ -1,7 +1,7 @@
-"""Deterministic data/RAG tools used by the DataTalk LangGraph.
+"""Deterministic data/RAG tools plus the Claude API adapter for DataTalk.
 
-The LLM decides *what* to query; these helpers handle data access, retrieval,
-mapping lookup and deterministic pandas fusion.
+LLM calls decide *what* to query. These helpers handle retrieval, data access,
+uploaded workspaces, cross-source mappings and deterministic pandas fusion.
 """
 
 from __future__ import annotations
@@ -19,17 +19,56 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 try:
+    from anthropic import Anthropic
+except ImportError:  # pragma: no cover
+    Anthropic = None
+
+try:
     from pymongo import MongoClient
-except ImportError:  # pragma: no cover - keeps SQL/RAG usable without Mongo installed
+except ImportError:  # pragma: no cover
     MongoClient = None
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT / "data"
+DEFAULT_DATA_DIR = ROOT / "data"
+DATA_DIR = Path(os.getenv("DATATALK_DATA_DIR", str(DEFAULT_DATA_DIR)))
 SQLITE_DOCS = DATA_DIR / "sqlite" / "database_docs.json"
 MONGO_DOCS = DATA_DIR / "mongodb" / "database_docs.json"
 MAPPINGS_FILE = DATA_DIR / "mappings.json"
 SQLITE_DB = DATA_DIR / "datatalk.db"
+UPLOADS_DIR = DATA_DIR / "uploads"
+
+
+# ---------------------------------------------------------------------------
+# Claude API
+# ---------------------------------------------------------------------------
+
+
+def claude_client() -> Any:
+    """Create the Anthropic client from CLAUDE_API_KEY."""
+    if Anthropic is None:
+        raise RuntimeError("anthropic is not installed")
+    api_key = os.getenv("CLAUDE_API_KEY")
+    if not api_key:
+        raise RuntimeError("CLAUDE_API_KEY is not configured")
+    return Anthropic(api_key=api_key)
+
+
+def claude_generate(prompt: str, *, system: str | None = None,
+                    max_tokens: int = 1200) -> str:
+    """Single Claude call used by LangGraph agents.
+
+    Model can be changed with CLAUDE_MODEL without changing application code.
+    """
+    client = claude_client()
+    model = os.getenv("CLAUDE_MODEL", "claude-sonnet-5")
+    message = client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        system=system or "You are a precise assistant for the DataTalk NL-to-Query system.",
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return "".join(block.text for block in message.content if getattr(block, "type", None) == "text")
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +84,6 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def load_database_docs(database: str) -> dict[str, Any]:
-    """Load the structured documentation for one database."""
     path = SQLITE_DOCS if database.lower() == "sqlite" else MONGO_DOCS
     return load_json(path)
 
@@ -56,7 +94,6 @@ def load_mappings() -> list[dict[str, Any]]:
 
 def find_mapping(entity: str | None = None, sqlite_key: str | None = None,
                  mongo_key: str | None = None) -> list[dict[str, Any]]:
-    """Return explicit cross-source correspondences from mappings.json."""
     results = []
     entity_norm = (entity or "").lower()
     for mapping in load_mappings():
@@ -102,16 +139,13 @@ def _flatten_docs(database: str, payload: dict[str, Any]) -> list[DocumentChunk]
                 f"{c.get('name', '')} {c.get('type', '')} {c.get('description', '')}"
                 for c in fields
             )
-            text = (
-                f"collection {collection.get('name', '')} "
-                f"{collection.get('description', '')} {field_text}"
-            )
+            text = f"collection {collection.get('name', '')} {collection.get('description', '')} {field_text}"
             chunks.append(DocumentChunk(database, collection.get("name", ""), text, collection))
     return chunks
 
 
 class DatabaseRAG:
-    """Small, local retriever; no external vector DB is required for the MVP."""
+    """Local TF-IDF retriever over uploaded/committed JSON documentation."""
 
     def __init__(self) -> None:
         self.chunks = (
@@ -119,35 +153,34 @@ class DatabaseRAG:
             + _flatten_docs("mongodb", load_database_docs("mongodb"))
         )
         self.vectorizer = TfidfVectorizer(lowercase=True, ngram_range=(1, 2))
-        self.matrix = (
-            self.vectorizer.fit_transform([c.text for c in self.chunks])
-            if self.chunks else None
-        )
+        self.matrix = self.vectorizer.fit_transform([c.text for c in self.chunks]) if self.chunks else None
 
     def retrieve(self, question: str, database: str | None = None, k: int = 3) -> list[dict[str, Any]]:
-        candidates = [
-            (i, c) for i, c in enumerate(self.chunks)
-            if database is None or c.database == database.lower()
-        ]
+        candidates = [(i, c) for i, c in enumerate(self.chunks)
+                      if database is None or c.database == database.lower()]
         if not candidates or self.matrix is None:
             return []
+        candidate_indices = [i for i, _ in candidates]
         query_vector = self.vectorizer.transform([question])
-        scores = cosine_similarity(query_vector, self.matrix[candidates_i := [i for i, _ in candidates]])[0]
+        scores = cosine_similarity(query_vector, self.matrix[candidate_indices])[0]
         ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)[:k]
         return [
-            {"database": c.database, "name": c.name, "score": float(score), "metadata": c.metadata, "text": c.text}
-            for score, (_, c) in ranked
-            if score > 0
+            {"database": c.database, "name": c.name, "score": float(score),
+             "metadata": c.metadata, "text": c.text}
+            for score, (_, c) in ranked if score > 0
         ]
 
     def context(self, question: str, database: str | None = None, k: int = 3) -> str:
         docs = self.retrieve(question, database, k)
-        return "\n\n".join(
-            f"[{d['database']}.{d['name']}] {d['text']}" for d in docs
-        )
+        return "\n\n".join(f"[{d['database']}.{d['name']}] {d['text']}" for d in docs)
 
 
 _rag: DatabaseRAG | None = None
+
+
+def reset_rag() -> None:
+    global _rag
+    _rag = None
 
 
 def get_rag() -> DatabaseRAG:
@@ -158,12 +191,64 @@ def get_rag() -> DatabaseRAG:
 
 
 # ---------------------------------------------------------------------------
+# Uploaded workspace helpers
+# ---------------------------------------------------------------------------
+
+
+def save_upload(filename: str, content: bytes, target: str) -> Path:
+    """Save a user upload into the active DataTalk workspace.
+
+    target: sqlite-db | sqlite-docs | mongodb-docs | mappings
+    """
+    safe_name = Path(filename).name
+    if not safe_name:
+        raise ValueError("Invalid filename")
+    targets = {
+        "sqlite-db": (DATA_DIR, {".db", ".sqlite", ".sqlite3"}),
+        "sqlite-docs": (DATA_DIR / "sqlite", {".json"}),
+        "mongodb-docs": (DATA_DIR / "mongodb", {".json"}),
+        "mappings": (DATA_DIR, {".json"}),
+    }
+    if target not in targets:
+        raise ValueError("Unknown upload target")
+    directory, allowed = targets[target]
+    suffix = Path(safe_name).suffix.lower()
+    if suffix not in allowed:
+        raise ValueError(f"Unsupported file type for {target}: {suffix}")
+    directory.mkdir(parents=True, exist_ok=True)
+    if target == "sqlite-db":
+        destination = SQLITE_DB
+    elif target == "sqlite-docs":
+        destination = SQLITE_DOCS
+    elif target == "mongodb-docs":
+        destination = MONGO_DOCS
+    else:
+        destination = MAPPINGS_FILE
+    destination.write_bytes(content)
+    if target in {"sqlite-docs", "mongodb-docs", "mappings"}:
+        reset_rag()
+    return destination
+
+
+def workspace_status() -> dict[str, Any]:
+    return {
+        "data_dir": str(DATA_DIR),
+        "sqlite_database": SQLITE_DB.exists(),
+        "sqlite_docs": SQLITE_DOCS.exists(),
+        "mongodb_docs": MONGO_DOCS.exists(),
+        "mappings": MAPPINGS_FILE.exists(),
+        "rag_documents": len(get_rag().chunks),
+        "claude_configured": bool(os.getenv("CLAUDE_API_KEY")),
+        "claude_model": os.getenv("CLAUDE_MODEL", "claude-sonnet-5"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Database execution
 # ---------------------------------------------------------------------------
 
 
 def execute_sql(query: str, db_path: str | Path = SQLITE_DB) -> list[dict[str, Any]]:
-    """Execute one read-only SQL statement and return JSON-friendly rows."""
     if not re.match(r"^\s*(SELECT|WITH)\b", query, re.IGNORECASE):
         raise ValueError("Only read-only SELECT/WITH SQL statements are allowed")
     with sqlite3.connect(str(db_path)) as conn:
@@ -173,7 +258,6 @@ def execute_sql(query: str, db_path: str | Path = SQLITE_DB) -> list[dict[str, A
 
 def execute_mongo(collection: str, pipeline: list[dict[str, Any]],
                   mongo_uri: str | None = None, database: str | None = None) -> list[dict[str, Any]]:
-    """Execute a MongoDB aggregation pipeline."""
     if MongoClient is None:
         raise RuntimeError("pymongo is not installed")
     uri = mongo_uri or os.getenv("MONGO_URI", "mongodb://localhost:27017")
@@ -192,21 +276,14 @@ def execute_mongo(collection: str, pipeline: list[dict[str, Any]],
 
 def merge_on_key(left: Iterable[dict[str, Any]], right: Iterable[dict[str, Any]],
                  left_key: str, right_key: str, how: str = "inner") -> list[dict[str, Any]]:
-    """Fuse SQL/Mongo results in memory with pandas; no LLM is involved."""
     left_df = pd.DataFrame(list(left))
     right_df = pd.DataFrame(list(right))
     if left_df.empty or right_df.empty:
         return []
-    merged = left_df.merge(
-        right_df,
-        left_on=left_key,
-        right_on=right_key,
-        how=how,
-        suffixes=("_sql", "_mongo"),
-    )
+    merged = left_df.merge(right_df, left_on=left_key, right_on=right_key,
+                           how=how, suffixes=("_sql", "_mongo"))
     return merged.where(pd.notna(merged), None).to_dict(orient="records")
 
 
 def hybrid_correspondences() -> list[dict[str, Any]]:
-    """Expose mappings for Join Planner and explainability."""
     return load_mappings()
