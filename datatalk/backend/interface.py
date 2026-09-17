@@ -1,7 +1,6 @@
 """FastAPI interface layer for DataTalk.
 
-This module is intentionally separate so it can be imported by the team's main.py
-without changing the LangGraph implementation owned by the other branch member.
+Keeps upload/configuration concerns separate from the LangGraph implementation.
 """
 
 from __future__ import annotations
@@ -79,6 +78,37 @@ async def upload(target: str, file: UploadFile = File(...)) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+@app.post("/upload/mongodb-data")
+async def upload_mongodb_data(file: UploadFile = File(...)) -> dict[str, Any]:
+    """Import a JSON MongoDB export into the configured MongoDB database.
+
+    Accepted shape: {"collection_name": [{...}, {...}], ...}.
+    This keeps MongoDB server-side while still allowing the web UI to load data.
+    """
+    try:
+        from pymongo import MongoClient
+        payload = json.loads((await file.read()).decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("MongoDB upload must be a JSON object mapping collection names to arrays")
+        client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"), serverSelectionTimeoutMS=3000)
+        db = client[os.getenv("MONGO_DB", "datatalk")]
+        imported = 0
+        try:
+            for collection_name, documents in payload.items():
+                if not isinstance(documents, list):
+                    raise ValueError(f"Collection '{collection_name}' must contain an array")
+                if documents:
+                    db[collection_name].delete_many({})
+                    db[collection_name].insert_many(documents)
+                    imported += len(documents)
+        finally:
+            client.close()
+        return {"ok": True, "target": "mongodb-data", "documents_imported": imported, "workspace": workspace_status()}
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"MongoDB import failed: {exc}") from exc
 
 @app.post("/claude/test")
 def claude_test() -> dict[str, str]:
