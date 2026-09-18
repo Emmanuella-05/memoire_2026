@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+langgraph
+langchain-core
+pydantic
+pandas
+pymongo
+scikit-learn
+python-dotenv
+anthropic
+python-multipart
