@@ -1,0 +1,5 @@
+{
+  "database": "sqlite",
+  "description": "Documentation structurée du schéma SQLite de DataTalk.",
+  "tables": []
+}

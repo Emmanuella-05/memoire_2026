@@ -1,0 +1,5 @@
+{
+  "database": "mongodb",
+  "description": "Documentation structurée du schéma MongoDB de DataTalk.",
+  "collections": []
+}
