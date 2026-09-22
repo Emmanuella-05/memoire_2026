@@ -1,16 +1,16 @@
 # DataTalk — Suivi de travail / passation
 
-> Document de passation pour la collègue chargée de l'intégration LangGraph. Il décrit ce qui est actuellement présent sur la branche `feature/data-rag-hybrid-interface`, ce qui reste à intégrer et les contrats à respecter.
+> Document de passation pour l'intégration LangGraph. Le travail ci-dessous concerne principalement les parties **Données / RAG / Hybrid / Interface** et est directement sur `main`.
 
 ## 1. Contexte
 
-Le travail réalisé ici couvre principalement la partie **Données / RAG / Hybrid / Interface** du projet DataTalk.
+Dépôt : `Octave2MK/memoire_2026`
 
-La branche de travail est :
+Branche utilisée : `main`
 
-`feature/data-rag-hybrid-interface`
+Le principe retenu est maintenant : **l'utilisateur fournit les données, pas la documentation technique des bases**. DataTalk inspecte automatiquement les bases disponibles, génère une documentation structurée pour le RAG et propose les correspondances SQL ↔ MongoDB.
 
-Le dépôt est : `Octave2MK/memoire_2026`
+Les règles métier restent optionnelles : elles peuvent être fournies par l'utilisateur pour compléter la connaissance technique par des contraintes métier explicites.
 
 ## 2. Ce qui est en place
 
@@ -20,39 +20,62 @@ Le fichier contient les services réutilisables par les agents LangGraph :
 
 - adaptateur Claude API via `anthropic` ;
 - configuration par variables d'environnement : `CLAUDE_API_KEY`, `CLAUDE_MODEL` ;
-- chargement des documentations JSON SQLite/MongoDB ;
-- chargement du catalogue `mappings.json` ;
-- recherche d'une correspondance SQL ↔ MongoDB ;
-- RAG local sur la documentation JSON avec TF-IDF + similarité cosinus ;
-- cache du RAG et fonction de réinitialisation après upload ;
-- validation des fichiers JSON de documentation et du catalogue de correspondances ;
-- validation basique d'une base SQLite uploadée ;
+- analyse automatique du schéma SQLite ;
+- analyse automatique du schéma MongoDB à partir des collections et d'un échantillon de documents ;
+- génération automatique de `data/sqlite/database_docs.json` ;
+- génération automatique de `data/mongodb/database_docs.json` ;
+- génération automatique de `data/mappings.json` lorsque des correspondances de clés sont détectées ;
+- stockage optionnel des règles métier dans `data/business_rules.json` ;
+- RAG local TF-IDF + similarité cosinus sur documentation générée + règles métier ;
+- cache du RAG et fonction de réinitialisation ;
 - exécution SQL en lecture seule (`SELECT` / `WITH`) ;
 - exécution MongoDB par pipeline d'agrégation ;
-- inspection du schéma SQLite avec `sqlite_schema()` ;
-- fusion déterministe de deux résultats avec pandas (`merge_on_key`) ;
-- récupération des correspondances hybrides.
+- fusion déterministe de résultats avec pandas ;
+- fonctions de consultation du catalogue de correspondances ;
+- fonction `analyze_workspace()` pour relancer toute l'analyse.
 
-**Principe important :** le LLM décide quoi demander et comment formuler la requête ; l'accès aux bases, la récupération documentaire et la fusion pandas restent des opérations déterministes.
+**Principe important :** le LLM décide quoi demander et comment formuler la requête ; l'inspection des bases, la génération de métadonnées, l'accès aux données et la fusion pandas restent déterministes.
 
-### RAG
+## 3. Analyse automatique des bases
 
-Le RAG est conçu comme une **infrastructure partagée**, pas comme un dixième agent.
+### SQLite
 
-Les documents indexés sont les documentations JSON de :
+`analyze_sqlite_schema()` inspecte :
 
-- `data/sqlite/database_docs.json`
-- `data/mongodb/database_docs.json`
+- tables ;
+- colonnes ;
+- types SQLite ;
+- nullabilité ;
+- clés primaires ;
+- clés étrangères ;
+- index.
 
-Le retriever retourne au maximum quelques documents pertinents (par défaut `k=3`) afin de limiter la taille des prompts.
+La documentation générée conserve les informations utiles au RAG et aux Schema Analysts.
 
-Les métadonnées conservées permettent de savoir si le contexte vient de `sqlite.<table>` ou `mongodb.<collection>`.
+### MongoDB
 
-### Hybrid
+`analyze_mongodb_schema()` inspecte :
 
-Le catalogue explicite des correspondances est :
+- collections ;
+- nombre de documents ;
+- échantillon de documents ;
+- chemins de champs imbriqués ;
+- types observés.
 
-`data/mappings.json`
+L'analyse est volontairement basée sur un échantillon pour éviter de parcourir inutilement toute la base.
+
+### Correspondances SQL ↔ MongoDB
+
+`analyze_correspondences()` compare les champs susceptibles d'être des clés et génère un catalogue explicite.
+
+Le premier mécanisme est volontairement conservateur :
+
+- champ de type identifiant/clé ;
+- nom normalisé identique ;
+- compatibilité de type ;
+- confiance et méthode conservées pour l'explicabilité.
+
+Le catalogue généré reste une source structurée pour le **Join Planner**. Le RAG ne doit pas être utilisé pour inventer une clé de jointure.
 
 Exemple de contrat :
 
@@ -63,27 +86,39 @@ Exemple de contrat :
       "entity": "customer",
       "sqlite": {"table": "customers", "key": "customer_id"},
       "mongodb": {"collection": "reviews", "key": "customer_id"},
-      "relation": "same_customer_id"
+      "relation": "same_normalized_key",
+      "confidence": 0.98,
+      "method": "deterministic_name_match"
     }
   ]
 }
 ```
 
-Le **Join Planner** doit lire ce catalogue directement. Il ne faut pas demander au RAG de deviner une clé de jointure uniquement par similarité sémantique.
+## 4. RAG
 
-La fusion finale doit être faite avec `merge_on_key()` / pandas et non par un LLM.
+Le RAG est une **infrastructure partagée**, pas un dixième agent.
 
-### Uploads via l'interface
+Il indexe automatiquement :
 
-L'API accepte maintenant :
+- `data/sqlite/database_docs.json` ;
+- `data/mongodb/database_docs.json` ;
+- `data/business_rules.json` si des règles métier ont été fournies.
 
-- une base SQLite (`.db`, `.sqlite`, `.sqlite3`) ;
-- les données MongoDB sous forme JSON ;
-- la documentation SQLite JSON ;
-- la documentation MongoDB JSON ;
-- le catalogue de correspondances JSON.
+Le retriever retourne au maximum quelques documents pertinents (par défaut `k=3`) afin de limiter la taille des prompts.
 
-Les documentations et mappings sont validés avant remplacement des fichiers actifs.
+Les métadonnées permettent de distinguer `sqlite.<table>`, `mongodb.<collection>` et `business.rule_X`.
+
+Pour le Join Planner, utiliser directement le catalogue structuré via `mapping_context()`, `find_mapping()` ou `hybrid_correspondences()`.
+
+## 5. Uploads via l'interface
+
+L'API accepte maintenant uniquement les entrées nécessaires :
+
+- base SQLite : `.db`, `.sqlite`, `.sqlite3` ;
+- données MongoDB au format JSON ;
+- règles métier optionnelles : `.json`, `.txt`, `.md`.
+
+Les documentations JSON et `mappings.json` ne sont plus des uploads obligatoires : ils sont générés automatiquement.
 
 Les données MongoDB JSON suivent ce format :
 
@@ -96,74 +131,44 @@ Les données MongoDB JSON suivent ce format :
 }
 ```
 
-L'import écrit ces documents dans la base MongoDB configurée par `MONGO_URI` et `MONGO_DB`.
+Après import MongoDB, l'analyse du workspace est automatiquement relancée.
 
-### FastAPI
+## 6. FastAPI
 
 `datatalk/backend/interface.py` expose :
 
-- `GET /health`
-- `POST /query`
-- `POST /upload/{target}` pour SQLite/docs/mappings
-- `POST /upload/mongodb-data`
-- `POST /claude/test`
+- `GET /health` ;
+- `GET /workspace` ;
+- `POST /analyze` pour relancer explicitement l'analyse ;
+- `POST /query` ;
+- `POST /upload/sqlite-db` ;
+- `POST /upload/business-rules` ;
+- `POST /upload/mongodb-data` ;
+- `POST /claude/test`.
 
-`datatalk/backend/main.py` expose l'application FastAPI afin de pouvoir lancer :
+Le endpoint `/query` reste découplé de LangGraph : il appelle `build_graph()` depuis `backend.graph` et récupère ensuite les champs de l'état.
 
-```bash
-uvicorn backend.main:app --reload
-```
+## 7. Frontend
 
-Le endpoint `/query` est volontairement découplé de l'implémentation LangGraph : il appelle `build_graph()` depuis `backend.graph` et récupère ensuite les champs de l'état.
+`datatalk/frontend/src/main.jsx` propose maintenant :
 
-### Frontend
+- upload de la base SQLite ;
+- upload des données MongoDB JSON ;
+- upload optionnel des règles métier ;
+- affichage du statut RAG ;
+- affichage du statut d'analyse automatique ;
+- bouton de réanalyse ;
+- question en langage naturel ;
+- résultat ;
+- traçabilité avec route, sources et correspondances.
 
-Une interface React/Vite minimale est présente dans `datatalk/frontend/`.
+L'utilisateur n'a donc plus à connaître ni fournir le format interne des documentations générées.
 
-Elle permet :
-
-- d'uploader la base SQLite ;
-- d'uploader les données MongoDB JSON ;
-- d'uploader les documentations SQLite/MongoDB ;
-- d'uploader `mappings.json` ;
-- de poser une question en langage naturel ;
-- d'afficher la réponse ;
-- d'afficher les données retournées ;
-- d'afficher une section de traçabilité contenant la route, les sources et les correspondances.
-
-L'URL du backend est configurable avec `VITE_API_URL`.
-
-## 3. Structure des données actuellement prévue
-
-```text
-datatalk/
-├── backend/
-│   ├── agent.py
-│   ├── graph.py
-│   ├── interface.py
-│   ├── main.py
-│   └── tools.py
-├── data/
-│   ├── sqlite/
-│   │   └── database_docs.json
-│   ├── mongodb/
-│   │   └── database_docs.json
-│   ├── mappings.json
-│   ├── datatalk.db
-│   └── README.md
-├── frontend/
-├── requirements.txt
-├── .env.example
-└── .gitignore
-```
-
-Les fichiers de documentation et `mappings.json` présents dans la branche sont actuellement des **templates vides** : les vrais schémas et vraies correspondances doivent encore être fournis par l'équipe. Aucune structure métier n'a été inventée.
-
-## 4. Contrat attendu côté LangGraph
+## 8. Contrat attendu côté LangGraph
 
 L'API attend que `build_graph()` soit disponible dans `backend/graph.py`.
 
-L'état retourné devrait idéalement contenir les champs suivants :
+L'état retourné devrait idéalement contenir :
 
 ```text
 question
@@ -180,7 +185,6 @@ mongo_schema_context
 mongo_query
 mongo_result
 mongo_error
-mongo_attempts
 join_plan
 merged_result
 retrieved_context
@@ -197,7 +201,7 @@ Le `/query` lit notamment :
 - `sources_used` ;
 - `correspondences_used` (ou `join_plan`).
 
-## 5. Architecture d'intégration visée
+## 9. Architecture d'intégration visée
 
 ```text
 React
@@ -234,68 +238,77 @@ Les 9 composants/agents retenus par le cahier des charges restent :
 8. Join Planner
 9. Result Merger
 
-Le RAG et les accès DB sont des outils/services partagés, pas des agents supplémentaires.
+Le RAG, l'analyse automatique des bases et les accès DB sont des outils/services partagés, pas des agents supplémentaires.
 
-## 6. Points importants pour la collègue
+## 10. Fonctions utiles pour la collègue
 
-### Utiliser les outils existants
-
-Les agents peuvent appeler les fonctions de `tools.py` plutôt que de réimplémenter l'accès aux données.
-
-Pour le RAG :
+RAG :
 
 ```python
 from .tools import get_rag
 context = get_rag().context(question, database="sqlite", k=3)
 ```
 
-Pour SQLite :
+SQLite :
 
 ```python
 from .tools import execute_sql
 rows = execute_sql(sql_query)
 ```
 
-Pour MongoDB :
+MongoDB :
 
 ```python
 from .tools import execute_mongo
 rows = execute_mongo(collection, pipeline)
 ```
 
-Pour le catalogue hybride :
+Catalogue hybride :
 
 ```python
-from .tools import find_mapping, hybrid_correspondences
+from .tools import mapping_context, find_mapping, hybrid_correspondences
 ```
 
-Pour la fusion :
+Fusion :
 
 ```python
 from .tools import merge_on_key
 merged = merge_on_key(sql_rows, mongo_rows, "customer_id", "customer_id")
 ```
 
-Pour Claude :
+Claude :
 
 ```python
 from .tools import claude_generate
 text = claude_generate(prompt)
 ```
 
-### Ne pas ajouter d'agent RAG
+## 11. Structure de données
 
-Le RAG est déjà un service. Il peut être appelé depuis le Router, les Schema Analysts, les Generators et éventuellement le Join Planner.
+```text
+datatalk/
+├── backend/
+│   ├── agent.py
+│   ├── graph.py
+│   ├── interface.py
+│   ├── main.py
+│   └── tools.py
+├── data/
+│   ├── sqlite/
+│   │   └── database_docs.json      # généré automatiquement
+│   ├── mongodb/
+│   │   └── database_docs.json      # généré automatiquement
+│   ├── mappings.json                # généré automatiquement
+│   ├── business_rules.json          # optionnel
+│   ├── datatalk.db
+│   └── README.md
+├── frontend/
+├── requirements.txt
+├── .env.example
+└── .gitignore
+```
 
-### Ne pas ajouter d'agent de fusion LLM
-
-La fusion hybride est déterministe et doit rester dans pandas.
-
-### Ne pas dépendre du schéma réel avant son import
-
-Les templates JSON sont volontairement vides. Dès que les vrais fichiers sont disponibles, ils peuvent être envoyés depuis l'interface ou placés dans `data/`.
-
-## 7. Configuration locale
+## 12. Configuration locale
 
 Créer `.env` à partir de `.env.example` et renseigner notamment :
 
@@ -310,56 +323,44 @@ VITE_API_URL=http://localhost:8000
 
 La clé Claude ne doit jamais être commitée.
 
-## 8. Dépendances ajoutées
-
-`datatalk/requirements.txt` contient notamment :
-
-- FastAPI / Uvicorn
-- LangGraph / LangChain Core
-- Pydantic
-- pandas
-- pymongo
-- scikit-learn
-- python-dotenv
-- anthropic
-
-## 9. État actuel / limites
+## 13. État actuel / prochaines priorités
 
 ### En place
 
-- architecture de stockage des données ;
-- contrat JSON des documentations ;
-- catalogue JSON des correspondances ;
-- RAG local fonctionnel au niveau du code ;
+- stockage des données ;
+- analyse automatique SQLite/MongoDB ;
+- génération des documentations ;
+- génération prudente des correspondances ;
+- RAG local ;
+- règles métier optionnelles ;
 - outils SQL/Mongo/pandas ;
 - adaptateur Claude ;
-- upload depuis l'interface ;
-- endpoints FastAPI ;
-- point d'entrée `main.py` ;
+- uploads FastAPI ;
+- endpoint de réanalyse ;
 - interface React minimale ;
-- contrat d'intégration avec LangGraph documenté.
+- contrat d'intégration LangGraph documenté.
 
-### À faire
+### Priorités restantes
 
-1. Fournir/importer les **vraies documentations JSON** SQLite et MongoDB.
-2. Fournir/importer le **vrai `mappings.json`**.
-3. Fournir/importer la **vraie base SQLite** et les données MongoDB de démonstration.
-4. Implémenter les 9 agents dans `agent.py` et la coordination dans `graph.py`.
-5. Connecter les agents au RAG et aux outils existants.
-6. Tester au minimum : SQL simple, Mongo simple et plusieurs cas hybrides.
-7. Ajouter l'évaluation des résultats et de la pertinence du plan.
-8. Tester le frontend avec le backend réel.
+1. Implémenter/intégrer les 9 agents dans `agent.py` et la coordination dans `graph.py`.
+2. Brancher les agents sur `get_rag()`, `mapping_context()`, `execute_sql()`, `execute_mongo()` et `merge_on_key()`.
+3. Tester SQL simple, Mongo simple et plusieurs cas hybrides.
+4. Ajouter l'évaluation des résultats et de la pertinence du plan.
+5. Tester le frontend avec le backend réel.
 
-## 10. Important — niveau de validation
+## 14. Niveau de validation
 
-Les fichiers ont été écrits et poussés sur GitHub, mais **l'exécution complète de l'application n'a pas encore été effectuée dans cette session**. Il faut donc considérer les points ci-dessus comme une implémentation à intégrer/tester, et non comme une démonstration end-to-end déjà validée.
+Les modifications ont été écrites et poussées sur GitHub, directement sur `main`. **L'exécution complète de l'application n'a pas été effectuée dans cette session** ; il faut donc encore lancer les tests locaux avant de considérer le parcours end-to-end comme validé.
 
-## 11. Historique de cette session
+## 15. Historique récent
 
-- reprise de la branche `feature/data-rag-hybrid-interface` ;
-- vérification de l'état du backend ;
-- correction de l'ordre des routes FastAPI afin que `/upload/mongodb-data` soit effectivement accessible ;
-- ajout de validation des documentations JSON, mappings et bases SQLite uploadées ;
-- ajout de `sqlite_schema()` pour fournir une inspection déterministe du schéma ;
-- ajout de `backend/main.py` comme point d'entrée FastAPI ;
-- ajout de ce document de passation.
+- passage explicite du workflow sur `main` ;
+- remplacement du modèle « l'utilisateur fournit les docs/mappings » par « l'utilisateur fournit les données, DataTalk analyse automatiquement » ;
+- ajout de l'analyse automatique SQLite ;
+- ajout de l'analyse automatique MongoDB ;
+- génération automatique des documentations JSON ;
+- génération automatique des correspondances SQL ↔ MongoDB ;
+- ajout du support optionnel des règles métier ;
+- extension du RAG aux règles métier ;
+- ajout de `GET /workspace` et `POST /analyze` ;
+- simplification de l'interface React pour supprimer les uploads de documentation/mappings.
