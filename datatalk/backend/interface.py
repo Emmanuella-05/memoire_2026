@@ -1,6 +1,7 @@
 """FastAPI interface layer for DataTalk.
 
-Keeps upload/configuration concerns separate from the LangGraph implementation.
+Users upload the databases/data; schema documentation and SQL<->Mongo
+correspondences are generated automatically by the data tools.
 """
 
 from __future__ import annotations
@@ -14,11 +15,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 try:
-    from .tools import claude_generate, save_upload, workspace_status
+    from .tools import (
+        analyze_workspace,
+        claude_generate,
+        save_upload,
+        workspace_status,
+    )
 except ImportError:
-    from tools import claude_generate, save_upload, workspace_status
+    from tools import analyze_workspace, claude_generate, save_upload, workspace_status
 
-app = FastAPI(title="DataTalk API", version="0.1.0")
+app = FastAPI(title="DataTalk API", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")],
@@ -51,6 +57,21 @@ def health() -> dict[str, Any]:
     return {"status": "ok", "workspace": workspace_status()}
 
 
+@app.get("/workspace")
+def workspace() -> dict[str, Any]:
+    """Return current automatic analysis status."""
+    return workspace_status()
+
+
+@app.post("/analyze")
+def analyze() -> dict[str, Any]:
+    """Explicitly regenerate schema docs, mappings and the RAG index."""
+    try:
+        return {"ok": True, "analysis": analyze_workspace(), "workspace": workspace_status()}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.post("/query")
 def query(payload: QueryRequest) -> dict[str, Any]:
     question = payload.question.strip()
@@ -60,11 +81,17 @@ def query(payload: QueryRequest) -> dict[str, Any]:
         state = get_graph().invoke({"question": question})
         return {
             "answer": state.get("final_answer", state.get("answer", "")),
-            "data": state.get("merged_result", state.get("sql_result", state.get("mongo_result", []))),
+            "data": state.get(
+                "merged_result",
+                state.get("sql_result", state.get("mongo_result", [])),
+            ),
             "execution": {
                 "route": state.get("query_type", "UNKNOWN"),
                 "sources": state.get("sources_used", []),
-                "correspondences": state.get("correspondences_used", state.get("join_plan", [])),
+                "correspondences": state.get(
+                    "correspondences_used",
+                    state.get("join_plan", []),
+                ),
             },
         }
     except Exception as exc:
@@ -73,11 +100,7 @@ def query(payload: QueryRequest) -> dict[str, Any]:
 
 @app.post("/upload/mongodb-data")
 async def upload_mongodb_data(file: UploadFile = File(...)) -> dict[str, Any]:
-    """Import a JSON MongoDB export into the configured MongoDB database.
-
-    Accepted shape: {"collection_name": [{...}, {...}], ...}.
-    This keeps MongoDB server-side while allowing the web UI to load test data.
-    """
+    """Import JSON MongoDB data and automatically analyze its schema."""
     try:
         from pymongo import MongoClient
 
@@ -86,7 +109,9 @@ async def upload_mongodb_data(file: UploadFile = File(...)) -> dict[str, Any]:
             raise ValueError("MongoDB data upload must be a .json file")
         payload = json.loads((await file.read()).decode("utf-8"))
         if not isinstance(payload, dict) or not payload:
-            raise ValueError("MongoDB upload must be a non-empty JSON object mapping collection names to arrays")
+            raise ValueError(
+                "MongoDB upload must be a non-empty JSON object mapping collection names to arrays"
+            )
 
         client = MongoClient(
             os.getenv("MONGO_URI", "mongodb://localhost:27017"),
@@ -112,11 +137,13 @@ async def upload_mongodb_data(file: UploadFile = File(...)) -> dict[str, Any]:
         finally:
             client.close()
 
+        analysis = analyze_workspace()
         return {
             "ok": True,
             "target": "mongodb-data",
             "collections_imported": collections,
             "documents_imported": imported,
+            "analysis": analysis,
             "workspace": workspace_status(),
         }
     except (ValueError, json.JSONDecodeError) as exc:
@@ -127,7 +154,7 @@ async def upload_mongodb_data(file: UploadFile = File(...)) -> dict[str, Any]:
 
 @app.post("/upload/{target}")
 async def upload(target: str, file: UploadFile = File(...)) -> dict[str, Any]:
-    allowed = {"sqlite-db", "sqlite-docs", "mongodb-docs", "mappings"}
+    allowed = {"sqlite-db", "business-rules"}
     if target not in allowed:
         raise HTTPException(status_code=400, detail="Unsupported upload target")
     try:
@@ -137,6 +164,7 @@ async def upload(target: str, file: UploadFile = File(...)) -> dict[str, Any]:
             "ok": True,
             "target": target,
             "filename": destination.name,
+            "analysis": analyze_workspace() if target == "business-rules" else None,
             "workspace": workspace_status(),
         }
     except (ValueError, json.JSONDecodeError) as exc:
