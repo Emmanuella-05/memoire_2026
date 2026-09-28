@@ -1,96 +1,129 @@
 # DataTalk — données, RAG, Claude et interface
 
-## Configuration
+## Vue d'ensemble
 
-1. Copier `.env.example` vers `.env` et renseigner `CLAUDE_API_KEY`.
-2. Installer `requirements.txt`.
-3. Pour MongoDB, lancer MongoDB et renseigner `MONGO_URI` / `MONGO_DB`.
+DataTalk est une preuve de concept d'un système de requêtes en langage naturel sur plusieurs sources de données. Le projet combine :
+
+- une base SQLite ;
+- des exports MongoDB ;
+- de la documentation technique JSON ;
+- des correspondances SQL ↔ MongoDB ;
+- un pipeline RAG pour rechercher les informations utiles ;
+- un agent LLM Claude pour synthétiser la réponse finale.
+
+## Configuration rapide
+
+1. Copier `.env.example` vers `.env`.
+2. Renseigner `CLAUDE_API_KEY`.
+3. Vérifier `CLAUDE_MODEL` si nécessaire.
+4. Installer les dépendances : `pip install -r requirements.txt`.
+5. Lancer MongoDB localement si vous utilisez une base MongoDB.
+6. Définir `MONGO_URI` et `MONGO_DB` dans le fichier `.env`.
+
+## Variables d'environnement
+
+Le projet attend les variables suivantes dans le fichier `.env` à la racine :
+
+```env
+CLAUDE_API_KEY=your_key_here
+CLAUDE_MODEL=claude-sonnet-5
+MONGO_URI=mongodb://localhost:27017
+MONGO_DB=datatalk
+```
+
+La clé API doit être stockée dans `.env`, jamais dans le code ni dans le dépôt Git.
 
 ## Claude
 
-Les agents peuvent utiliser `backend.tools.claude_generate()`. Le modèle par défaut est `claude-sonnet-5`; il peut être changé avec `CLAUDE_MODEL` sans modifier le code.
+Les agents utilisent `claude_generate()` dans `backend/llm.py`. Par défaut, le modèle est `claude-sonnet-5`, configurable via `CLAUDE_MODEL`.
 
-## Uploads depuis React
+## Uploads depuis le frontend
 
-L'interface propose :
-- une base SQLite `.db/.sqlite/.sqlite3` ;
+L'interface accepte :
+- une base SQLite `.db`, `.sqlite` ou `.sqlite3` ;
 - un export JSON MongoDB de la forme `{ "collection": [{...}, {...}] }` ;
 - la documentation SQLite JSON ;
 - la documentation MongoDB JSON ;
 - `mappings.json` pour les correspondances SQL ↔ MongoDB.
 
-La documentation et les mappings sont rechargés/indexés après upload. Les correspondances restent explicites et ne sont pas déduites uniquement par le RAG.
+La documentation et les mappings sont rechargés / indexés après upload.
 
-## Interface FastAPI
+## API FastAPI
 
-`backend/interface.py` contient l'API `/query`, `/upload/...`, `/upload/mongodb-data`, `/health` et `/claude/test`. Le `main.py` de l'équipe peut simplement exposer cette `app` ou reprendre ses routes lors de l'intégration finale.
+Le backend expose une API FastAPI via `backend/main.py`.
+
+Principaux endpoints :
+- `GET /health`
+- `GET /status`
+- `POST /ask`
+- `/upload/...` selon le flux d'ingestion
 
 ## Important
 
-Ne jamais committer `.env` ni la clé Claude. Le `.gitignore` les exclut.
+- Ne jamais committer `.env` ni la clé Claude.
+- Le `.gitignore` doit exclure les secrets et les fichiers générés.
 
 ## Description du travail effectué
 
-Ce dépôt contient une preuve de concept d'un pipeline RAG (Retrieval-Augmented Generation) et une interface minimale. Travaux réalisés :
+Ce dépôt contient une preuve de concept d'un pipeline RAG (Retrieval-Augmented Generation) associé à une interface minimale pour interroger des données multiples. La pile couvre :
 
-- **Ingestion et catalogage :** outils pour charger et indexer des sources (SQLite, export MongoDB, JSON de documentation) et utiliser `mappings.json` pour les correspondances entre schémas.
-- **Génération d'embeddings & retrieval :** pipeline d'`embeddings` et `retriever` dans `backend/rag/` pour vectoriser les documents et interroger l'index.
-- **Composants RAG :** composants backend qui orchestrent la récupération d'informations et la génération assistée par LLM (`llm.py`, `rag/retriever.py`).
-- **Agents spécialisés :** agents modulaires pour gérer différentes sources et tâches : `sql_agent.py`, `mongo_agent.py`, `classifier.py`, `join_planner.py`, `result_merger.py` — chacun encapsule la logique d'interrogation, planification et fusion des résultats.
-- **Outils utilitaires :** fonctions d'assistance pour manipuler le catalogue, interagir avec MongoDB/SQL et faciliter les workflows RAG (`tools/`).
-- **Interface front-end minimale :** une UI React/HTML dans `frontend/` pour téléverser des sources, lancer l'indexation et envoyer des requêtes vers l'API FastAPI backend.
-- **Exemples et configuration :** fichiers d'exemple et instructions pour configurer les clés (Claude), MongoDB et l'environnement Python.
+- **Ingestion et catalogage :** chargement de sources SQL/NoSQL et indexation de la documentation.
+- **Génération d'embeddings & retrieval :** règles de vectorisation et recherche dans le catalogue documentaire.
+- **Agents spécialisés :** classification, génération SQL, génération MongoDB, planification de jointures, fusion des résultats.
+- **Synthèse LLM :** réponse finale rédigée en français à partir des données récupérées.
+- **Front-end :** interface légère pour uploader les données et lancer des requêtes.
 
-Le travail se concentre sur la démonstration d'un flux de bout en bout : ingestion → indexation → récupération → fusion + génération. Si vous le souhaitez, je peux :
+## Détails des modules
 
-- détailler chaque module (`backend/agents`, `backend/rag`) dans le README;
-- ajouter un schéma d'architecture et des exemples d'utilisation;
-- fournir des commandes pour lancer et tester localement.
+- **`backend/` :** orchestration globale et API FastAPI.
+- **`backend/llm.py` :** wrapper Anthropic / Claude partagé par les agents.
+- **`backend/graph.py` :** graphe central d'exécution et logique de routage.
+- **`backend/rag/embeddings.py` :** génération d'embeddings.
+- **`backend/rag/retriever.py` :** recherche vectorielle sur le catalogue.
+- **`backend/agents/` :**
+  - `classifier.py` : décide si la question relève de SQL, MongoDB ou hybride.
+  - `sql_agent.py` : génère et exécute une requête SQL en lecture seule.
+  - `mongo_agent.py` : génère et exécute un pipeline MongoDB.
+  - `join_planner.py` : prépare la jointure entre résultats SQL et MongoDB.
+  - `result_merger.py` : fusionne les résultats et construit la réponse finale.
+- **`backend/tools/` :** utilitaires SQLite, MongoDB, catalogue et RAG.
+- **`data/` :** schémas documentés et mappings de correspondance.
+- **`frontend/` :** interface utilisateur minimale.
 
-### Détails des modules
-
-- **`backend/` :** point d'entrée et orchestration backend. Contient la logique FastAPI, l'initialisation des agents et la configuration des services.
-
-- **`backend/rag/embeddings.py` :** génération d'embeddings pour documents et enregistrements. Normalise les textes, gère les batchs et produit des vecteurs utilisés par l'index.
-
-- **`backend/rag/retriever.py` :** logique de recherche vectorielle et ranking des passages. Encapsule les requêtes vers l'index vectoriel et la conversion score → passages.
-
-- **`backend/llm.py` :** wrapper pour les appels LLM (Claude par défaut). Centralise les templates de prompt, la gestion des tokens et des paramètres de génération.
-
-- **`backend/graph.py` :** utilitaires pour représentation/visualisation des relations entre entités ou pipelines (optionnel selon usage).
-
-- **`backend/main.py` / `backend/interface.py` :** expose l'API HTTP (`/query`, `/upload/*`, `/health`, `/claude/test`) et orchestre le pipeline RAG et les agents.
-
-- **`backend/agents/` :** agents spécialisés :
-	- `sql_agent.py` : extraction et transformation depuis bases SQLite/SQL.
-	- `mongo_agent.py` : ingestion et interrogation d'exports MongoDB.
-	- `classifier.py` : routage des requêtes/document classification.
-	- `join_planner.py` : planification et exécution de jointures multi-sources.
-	- `result_merger.py` : fusion et post-traitement des résultats multi-agents.
-
-- **`backend/tools/` :** helpers pour ingestion, mapping, interaction avec Mongo/SQL et utilitaires RAG (`catalog_tools.py`, `mongo_tools.py`, `sql_tools.py`, `rag_tools.py`).
-
-- **`catalog/` & `ingestion/` :** scripts et artefacts pour construire le catalogue de sources et pipelines d'ingestion.
-
-- **`data/` :** exemples d'exports (`sqlite/database_docs.json`, `mongodb/database_docs.json`) et `mappings.json` pour correspondances entre schémas.
-
-- **`frontend/` :** UI minimale (React + HTML) pour téléverser des fichiers, déclencher l'indexation et consulter l'API.
-
-### Schéma d'architecture (Mermaid)
+## Schéma d'architecture
 
 ```mermaid
 flowchart TD
-	User[Utilisateur / Navigateur] -->|Téléversement / Requête| Frontend[Frontend UI]
-	Frontend -->|HTTP| API[FastAPI Backend]
-	API -->|orchestrer| Agents[Agents (SQL / Mongo / Classifier / Planner)]
-	Agents -->|ingestion/requête| Ingest[Ingestion & Catalogue]
-	Ingest -->|indexer| Emb[Embeddings & Index]
-	API -->|query| Retriever[Retriever]
-	Retriever -->|documents| Merger[Result Merger]
-	Merger -->|prompt| LLM[LLM (Claude)]
-	LLM -->|réponse| API
-	Data[(SQLite / MongoDB / JSON / mappings.json)] -->|sources| Ingest
-	style User fill:#f9f,stroke:#333,stroke-width:1px
+    User[Utilisateur] --> Frontend[Frontend]
+    Frontend --> API[FastAPI Backend]
+    API --> Classifier[Classifier]
+    Classifier --> SQL[SQL Agent]
+    Classifier --> Mongo[Mongo Agent]
+    SQL --> Merge[Result Merger]
+    Mongo --> Merge
+    Merge --> LLM[Claude LLM]
+    LLM --> Response[Réponse finale]
+    Data[(SQLite / MongoDB / JSON)] --> API
 ```
 
-Souhaitez-vous que j'exporte ce diagramme en PNG/SVG et que j'ajoute une section `Exemples d'utilisation` avec commandes de démarrage ?
+## Lancement local
+
+Depuis le dossier `datatalk` :
+
+```bash
+pip install -r requirements.txt
+copy .env.example .env
+# puis compléter la clé Claude dans .env
+python -m uvicorn backend.main:app --reload
+```
+
+## Vérification du gitignore
+
+Le `.gitignore` du projet doit exclure :
+- les variables d'environnement (`.env`, `.env.*`),
+- les environnements virtuels (`venv/`, `.venv/`),
+- les fichiers Python générés (`__pycache__/`, `*.pyc`),
+- les bases de données locales (`*.db`, `*.sqlite`, `*.sqlite3`),
+- les dépendances frontend (`node_modules/`).
+
+C’est bien le cas après mise à jour.

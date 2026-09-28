@@ -1,23 +1,82 @@
-"""Outil RAG exposé aux agents.
+"""Helpers de catalogue et d'ingestion pour DataTalk.
 
-Délègue la recherche vectorielle à rag/retriever.py (embeddings +
-vectorstore) ; ne conserve ici que ce qui touche au catalogue de fichiers
-(règles métier) et une façade stable pour les agents (`retrieve`, `context`).
+Ce module centralise les chemins de données, les fichiers JSON, les loaders et
+les utilitaires communs partagés par les agents et le RAG.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-
-from .catalog_tools import BUSINESS_RULES_FILE, _write_json
-from rag import retriever
 import json
+import os
+from pathlib import Path
+from typing import Any
 
 
-# ---------------------------------------------------------------------------
-# Règles métier (fichier géré ici car il vit dans data/, comme le reste du
-# catalogue ; son contenu est ensuite indexé par rag/retriever.py)
-# ---------------------------------------------------------------------------
+DATA_DIR = Path(os.getenv("DATATALK_DATA_DIR", Path(__file__).resolve().parents[2] / "data")).resolve()
+SQLITE_DB = DATA_DIR / "sqlite" / "data.db"
+SQLITE_DOCS = DATA_DIR / "sqlite" / "database_docs.json"
+MONGO_DOCS = DATA_DIR / "mongodb" / "database_docs.json"
+MAPPINGS_FILE = DATA_DIR / "mappings.json"
+BUSINESS_RULES_FILE = DATA_DIR / "business_rules.json"
+
+
+def _ensure_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _write_json(path: Path, payload: Any) -> Path:
+    _ensure_parent(path)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def load_json(path: Path, default: Any = None) -> Any:
+    if not path.exists():
+        return default if default is not None else {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return default if default is not None else {}
+
+
+def load_database_docs(database: str) -> dict[str, Any]:
+    if database == "sqlite":
+        return load_json(SQLITE_DOCS, {"database": "sqlite", "tables": []})
+    if database == "mongodb":
+        return load_json(MONGO_DOCS, {"database": "mongodb", "collections": []})
+    raise ValueError(f"Unsupported database type: {database}")
+
+
+def load_mappings() -> list[dict[str, Any]]:
+    payload = load_json(MAPPINGS_FILE, {"mappings": []})
+    if isinstance(payload, dict):
+        return payload.get("mappings", [])
+    return payload if isinstance(payload, list) else []
+
+
+def mapping_context() -> str:
+    mappings = load_mappings()
+    return "\n".join(
+        f"- {m.get('entity', 'unknown')}: SQLite {m.get('sqlite', {}).get('table')}({m.get('sqlite', {}).get('key')}) -> MongoDB {m.get('mongodb', {}).get('collection')}({m.get('mongodb', {}).get('key')})"
+        for m in mappings
+    ) or "Aucune correspondance documentée."
+
+
+def merge_on_key(left: list[dict[str, Any]], right: list[dict[str, Any]], left_key: str, right_key: str) -> list[dict[str, Any]]:
+    right_by_key = {}
+    for row in right:
+        key = row.get(right_key)
+        if key is not None:
+            right_by_key[str(key)] = row
+    merged: list[dict[str, Any]] = []
+    for left_row in left:
+        left_value = left_row.get(left_key)
+        right_row = right_by_key.get(str(left_value), {})
+        merged_row = dict(left_row)
+        merged_row.update({f"mongo_{k}": v for k, v in right_row.items() if k != right_key})
+        merged.append(merged_row)
+    return merged
+
 
 def save_business_rules(content: bytes, filename: str = "business_rules.txt") -> Path:
     """Store optional business rules in a RAG-friendly canonical JSON format."""
@@ -44,26 +103,21 @@ def save_business_rules(content: bytes, filename: str = "business_rules.txt") ->
     if not rules:
         raise ValueError("No business rules found")
     _write_json(BUSINESS_RULES_FILE, {"rules": rules})
-    retriever.reset_index()
     return BUSINESS_RULES_FILE
 
 
-# ---------------------------------------------------------------------------
-# Façade RAG pour les agents (sql_agent, mongo_agent, join_planner...)
-# ---------------------------------------------------------------------------
-
-def retrieve(question: str, database: str | None = None, k: int = 3) -> list[dict]:
-    return retriever.retrieve(question, database, k)
-
-
-def context(question: str, database: str | None = None, k: int = 3) -> str:
-    return retriever.context(question, database, k)
-
-
-def reset_rag() -> None:
-    """À appeler après toute régénération de la doc (nouvelle base uploadée)."""
-    retriever.reset_index()
-
-
-def rag_document_count() -> int:
-    return len(retriever.get_index().chunks)
+__all__ = [
+    "DATA_DIR",
+    "SQLITE_DB",
+    "SQLITE_DOCS",
+    "MONGO_DOCS",
+    "MAPPINGS_FILE",
+    "BUSINESS_RULES_FILE",
+    "_write_json",
+    "load_json",
+    "load_database_docs",
+    "load_mappings",
+    "mapping_context",
+    "merge_on_key",
+    "save_business_rules",
+]

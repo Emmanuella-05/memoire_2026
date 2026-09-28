@@ -3,9 +3,9 @@ from __future__ import annotations
 from typing import Any
 
 try:
-    from .tools import claude_generate
-except ImportError:
-    from tools import claude_generate
+    from backend.llm import claude_generate
+except ImportError:  # pragma: no cover
+    from llm import claude_generate
 
 
 class SimpleGraph:

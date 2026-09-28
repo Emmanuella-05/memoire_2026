@@ -1,9 +1,32 @@
+# Python virtual environments
 venv/
-venv/
+.venv/
+env/
+ENV/
+
+# Python cache / build artifacts
 __pycache__/
-*.pyc
-.env
-.vscode/
-node_modules/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+build/
 dist/
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Editor / OS files
+.vscode/
+.idea/
 .DS_Store
+
+# Frontend dependencies
+node_modules/
+
+# Local database files
+*.db
+*.sqlite
+*.sqlite3

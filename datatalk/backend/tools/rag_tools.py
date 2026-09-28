@@ -1,23 +1,13 @@
-"""Outil RAG exposé aux agents.
-
-Délègue la recherche vectorielle à rag/retriever.py (embeddings +
-vectorstore) ; ne conserve ici que ce qui touche au catalogue de fichiers
-(règles métier) et une façade stable pour les agents (`retrieve`, `context`).
-"""
+"""Facade RAG exposée aux agents DataTalk."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
+from backend.rag import retriever
 from .catalog_tools import BUSINESS_RULES_FILE, _write_json
-from rag import retriever
 import json
 
-
-# ---------------------------------------------------------------------------
-# Règles métier (fichier géré ici car il vit dans data/, comme le reste du
-# catalogue ; son contenu est ensuite indexé par rag/retriever.py)
-# ---------------------------------------------------------------------------
 
 def save_business_rules(content: bytes, filename: str = "business_rules.txt") -> Path:
     """Store optional business rules in a RAG-friendly canonical JSON format."""
@@ -48,10 +38,6 @@ def save_business_rules(content: bytes, filename: str = "business_rules.txt") ->
     return BUSINESS_RULES_FILE
 
 
-# ---------------------------------------------------------------------------
-# Façade RAG pour les agents (sql_agent, mongo_agent, join_planner...)
-# ---------------------------------------------------------------------------
-
 def retrieve(question: str, database: str | None = None, k: int = 3) -> list[dict]:
     return retriever.retrieve(question, database, k)
 
@@ -61,7 +47,6 @@ def context(question: str, database: str | None = None, k: int = 3) -> str:
 
 
 def reset_rag() -> None:
-    """À appeler après toute régénération de la doc (nouvelle base uploadée)."""
     retriever.reset_index()
 
 
