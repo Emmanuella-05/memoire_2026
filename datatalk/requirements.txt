@@ -1,4 +1,4 @@
-fastapi
+﻿fastapi
 uvicorn[standard]
 langgraph
 langchain-core
@@ -9,3 +9,5 @@ scikit-learn
 python-dotenv
 anthropic
 python-multipart
+sentence-transformers
+numpy
