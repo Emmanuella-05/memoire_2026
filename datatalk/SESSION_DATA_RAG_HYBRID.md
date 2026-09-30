@@ -397,3 +397,19 @@ Routes restaurées pour compatibilité avec le frontend : `GET /health`, `GET /w
 Les réponses `/query` exposent `answer`, `data` et `execution` avec les informations SQL/Mongo/join utiles au frontend. Les résultats non JSON natifs sont convertis en chaînes avant réponse HTTP.
 
 Validation : modification poussée sur `main`. Le démarrage FastAPI et les appels réels restent à tester localement.
+
+
+## 18. Réparation 3 — cohérence des imports Python
+
+Le backend est lancé depuis la racine `datatalk/` avec `python -m uvicorn backend.main:app --reload`. Dans cette configuration, les imports internes devaient être cohérents avec le package `backend`.
+
+Corrections appliquées sur `main` :
+
+- `backend/graph.py` utilise maintenant les imports relatifs `.agents...`.
+- les agents `classifier`, `sql_agent`, `mongo_agent`, `join_planner` et `result_merger` utilisent les imports relatifs vers `backend.llm` et `backend.tools`.
+- `backend/tools/rag_tools.py` utilise `..rag`.
+- `backend/rag/retriever.py` utilise `..tools.catalog_tools`.
+
+Objectif : éviter les `ModuleNotFoundError` liés aux anciens imports `agents`, `tools` ou `llm` lorsque FastAPI importe `backend.main` comme package.
+
+Validation effectuée : relecture des fichiers modifiés sur `main`. Le démarrage Python réel reste à exécuter localement, car aucune exécution end-to-end n'a encore été réalisée dans cette session.
