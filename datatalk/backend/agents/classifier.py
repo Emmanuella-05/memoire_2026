@@ -12,8 +12,8 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
-from llm import claude_generate
-from tools.catalog_tools import load_database_docs, load_mappings
+from ..llm import claude_generate
+from ..tools.catalog_tools import load_database_docs, load_mappings
 
 Source = Literal["sql", "mongo", "hybrid"]
 
