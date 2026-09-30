@@ -364,3 +364,75 @@ Les modifications ont été écrites et poussées sur GitHub, directement sur `m
 - extension du RAG aux règles métier ;
 - ajout de `GET /workspace` et `POST /analyze` ;
 - simplification de l'interface React pour supprimer les uploads de documentation/mappings.
+
+
+## 16. Réparation 1 — intégration LangGraph
+
+La fausse implémentation `SimpleGraph` a été remplacée par un vrai `StateGraph` LangGraph.
+
+Flux actuellement branché :
+
+```text
+START → classifier
+  ├── SQL    → sql_agent → result_merger → END
+  ├── Mongo  → mongo_agent → result_merger → END
+  └── Hybrid → hybrid_sql → hybrid_mongo → join_planner → result_merger → END
+```
+
+Le graphe expose `build_graph()`, `graph` et `run(question)`.
+
+Le chemin hybride reste volontairement séquentiel pour cette première réparation.
+
+Point restant : les agents SQL/Mongo encapsulent encore génération, validation, exécution et correction. La décomposition stricte en composants séparés du cahier des charges sera traitée ensuite.
+
+Validation : code poussé sur `main` ; exécution locale end-to-end encore à faire.
+
+
+## 17. Réparation 2 — FastAPI
+
+`backend/main.py` a été reconnecté au vrai graphe via `from .graph import run`.
+
+Routes restaurées pour compatibilité avec le frontend : `GET /health`, `GET /workspace`, `GET /status`, `POST /analyze`, `POST /query`, `POST /ask`, `POST /upload/sqlite-db`, `POST /upload/mongodb-data`, `POST /upload/business-rules`, `POST /claude/test`.
+
+Les réponses `/query` exposent `answer`, `data` et `execution` avec les informations SQL/Mongo/join utiles au frontend. Les résultats non JSON natifs sont convertis en chaînes avant réponse HTTP.
+
+Validation : modification poussée sur `main`. Le démarrage FastAPI et les appels réels restent à tester localement.
+
+
+## 18. Réparation 3 — cohérence des imports Python
+
+Le backend est lancé depuis la racine `datatalk/` avec `python -m uvicorn backend.main:app --reload`. Dans cette configuration, les imports internes devaient être cohérents avec le package `backend`.
+
+Corrections appliquées sur `main` :
+
+- `backend/graph.py` utilise maintenant les imports relatifs `.agents...`.
+- les agents `classifier`, `sql_agent`, `mongo_agent`, `join_planner` et `result_merger` utilisent les imports relatifs vers `backend.llm` et `backend.tools`.
+- `backend/tools/rag_tools.py` utilise `..rag`.
+- `backend/rag/retriever.py` utilise `..tools.catalog_tools`.
+
+Objectif : éviter les `ModuleNotFoundError` liés aux anciens imports `agents`, `tools` ou `llm` lorsque FastAPI importe `backend.main` comme package.
+
+Validation effectuée : relecture des fichiers modifiés sur `main`. Le démarrage Python réel reste à exécuter localement, car aucune exécution end-to-end n'a encore été réalisée dans cette session.
+
+
+## 19. Réparation 4 — contrat d'état HYBRID + environnement virtuel
+
+Corrections appliquées sur `main` :
+
+### Contrat HYBRID
+- Le `Join Planner` est maintenant exécuté avant les agents SQL/Mongo en mode hybride.
+- Le `join_plan` est donc disponible dès la génération des deux requêtes.
+- L'agent SQL reçoit la clé SQLite de jointure et doit la retourner dans ses résultats.
+- L'agent MongoDB reçoit la clé MongoDB de jointure et doit la retourner dans ses résultats.
+- Si une source hybride retourne des lignes sans sa clé de jointure, l'agent déclenche son mécanisme de correction au lieu de produire une fusion incohérente.
+- Le `Result Merger` ne concatène plus arbitrairement les résultats SQL et Mongo en cas de problème de jointure. Il retourne une erreur explicite.
+- Une absence de résultat d'un côté hybride produit une jointure vide, et non une fausse concaténation.
+
+### Environnement virtuel
+Le `.gitignore` contenait déjà les règles `venv/`, `.venv/`, etc., mais cela ne suffisait pas car `datatalk/venv` était déjà suivi par Git.
+
+Les **855 entrées** du répertoire virtuel suivi ont été retirées de l'arbre Git. Le répertoire local n'est pas supprimé par cette opération ; il est simplement retiré du dépôt et restera ignoré grâce au `.gitignore`.
+
+Commit de nettoyage : `ca6a4fcf0aeed0cf6b2bf1170f7b5a03f743d84f`.
+
+La prochaine étape est maintenant la validation réelle du backend et des contrats, avant d'ajouter de nouvelles fonctionnalités.

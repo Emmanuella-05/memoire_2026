@@ -19,10 +19,10 @@ import json
 import re
 from typing import Any
 
-from llm import claude_generate
-from tools.catalog_tools import load_database_docs
-from tools.rag_tools import context as rag_context
-from tools.sql_tools import execute_sql, is_read_only
+from ..llm import claude_generate
+from ..tools.catalog_tools import load_database_docs
+from ..tools.rag_tools import context as rag_context
+from ..tools.sql_tools import execute_sql, is_read_only
 
 MAX_ATTEMPTS = 3
 
@@ -81,11 +81,18 @@ def _extract_json(raw: str) -> dict[str, Any]:
         return json.loads(match.group(0))
 
 
-def generate_sql(question: str) -> str:
+def generate_sql(question: str, join_plan: dict[str, Any] | None = None) -> str:
+    join_requirement = ""
+    if join_plan:
+        join_requirement = (
+            "\n\nContrainte HYBRID : cette requête sera jointe à MongoDB. "
+            f"Elle doit impérativement retourner la clé SQLite "
+            f"'{join_plan.get('sqlite_key')}' dans ses résultats."
+        )
     prompt = (
         f"Schéma SQLite:\n{_schema_summary()}\n\n"
         f"Contexte documentaire:\n{rag_context(question, database='sqlite')}\n\n"
-        f"Question: {question}"
+        f"Question: {question}{join_requirement}"
     )
     raw = claude_generate(prompt, system=GENERATE_SYSTEM_PROMPT, max_tokens=500)
     return _extract_json(raw)["sql"].strip()
@@ -110,10 +117,10 @@ def validate_sql(question: str, sql: str) -> dict[str, Any]:
         return {"valid": True, "issues": None}
 
 
-def run(question: str) -> dict[str, Any]:
+def run(question: str, join_plan: dict[str, Any] | None = None) -> dict[str, Any]:
     """Génère -> valide -> exécute, avec correction à chaque rejet ou erreur,
     jusqu'à MAX_ATTEMPTS."""
-    sql = generate_sql(question)
+    sql = generate_sql(question, join_plan)
     last_issue: str | None = None
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -132,6 +139,11 @@ def run(question: str) -> dict[str, Any]:
 
         try:
             rows = execute_sql(sql)
+            if join_plan and rows and not any(join_plan.get("sqlite_key") in row for row in rows):
+                raise ValueError(
+                    f"La requête SQL ne retourne pas la clé de jointure "
+                    f"'{join_plan.get('sqlite_key')}'."
+                )
             return {
                 "sql_query": sql,
                 "sql_results": rows,
@@ -163,4 +175,4 @@ def sql_agent_node(state: dict[str, Any]) -> dict[str, Any]:
     Ne renvoie que ces clés (pas tout `state`) : requis par LangGraph pour le
     fan-out parallèle avec mongo_agent en mode hybride (sinon conflit
     d'écriture concurrente sur 'question')."""
-    return run(state["question"])
+    return run(state["question"], state.get("join_plan"))

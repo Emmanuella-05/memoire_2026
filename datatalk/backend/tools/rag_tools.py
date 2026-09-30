@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from backend.rag import retriever
+from ..rag import retriever
 from .catalog_tools import BUSINESS_RULES_FILE, _write_json
 import json
 
