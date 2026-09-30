@@ -4,11 +4,11 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from agents.classifier import classifier_node
-from agents.join_planner import join_planner_node
-from agents.mongo_agent import mongo_agent_node
-from agents.result_merger import result_merger_node
-from agents.sql_agent import sql_agent_node
+from .agents.classifier import classifier_node
+from .agents.join_planner import join_planner_node
+from .agents.mongo_agent import mongo_agent_node
+from .agents.result_merger import result_merger_node
+from .agents.sql_agent import sql_agent_node
 
 
 class DataTalkState(TypedDict, total=False):
