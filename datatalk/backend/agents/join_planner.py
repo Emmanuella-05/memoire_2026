@@ -8,8 +8,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from llm import claude_generate
-from tools.catalog_tools import load_mappings, mapping_context
+from ..llm import claude_generate
+from ..tools.catalog_tools import load_mappings, mapping_context
 
 SYSTEM_PROMPT = """Tu es le planificateur de jointure de DataTalk.
 On te donne la question de l'utilisateur et la liste des correspondances
