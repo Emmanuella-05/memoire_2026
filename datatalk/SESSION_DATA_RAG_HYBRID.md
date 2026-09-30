@@ -386,3 +386,14 @@ Le chemin hybride reste volontairement séquentiel pour cette première réparat
 Point restant : les agents SQL/Mongo encapsulent encore génération, validation, exécution et correction. La décomposition stricte en composants séparés du cahier des charges sera traitée ensuite.
 
 Validation : code poussé sur `main` ; exécution locale end-to-end encore à faire.
+
+
+## 17. Réparation 2 — FastAPI
+
+`backend/main.py` a été reconnecté au vrai graphe via `from .graph import run`.
+
+Routes restaurées pour compatibilité avec le frontend : `GET /health`, `GET /workspace`, `GET /status`, `POST /analyze`, `POST /query`, `POST /ask`, `POST /upload/sqlite-db`, `POST /upload/mongodb-data`, `POST /upload/business-rules`, `POST /claude/test`.
+
+Les réponses `/query` exposent `answer`, `data` et `execution` avec les informations SQL/Mongo/join utiles au frontend. Les résultats non JSON natifs sont convertis en chaînes avant réponse HTTP.
+
+Validation : modification poussée sur `main`. Le démarrage FastAPI et les appels réels restent à tester localement.
