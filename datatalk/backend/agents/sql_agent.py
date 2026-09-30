@@ -19,10 +19,10 @@ import json
 import re
 from typing import Any
 
-from llm import claude_generate
-from tools.catalog_tools import load_database_docs
-from tools.rag_tools import context as rag_context
-from tools.sql_tools import execute_sql, is_read_only
+from ..llm import claude_generate
+from ..tools.catalog_tools import load_database_docs
+from ..tools.rag_tools import context as rag_context
+from ..tools.sql_tools import execute_sql, is_read_only
 
 MAX_ATTEMPTS = 3
 
