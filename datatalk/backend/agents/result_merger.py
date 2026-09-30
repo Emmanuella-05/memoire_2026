@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from llm import claude_generate
-from tools.catalog_tools import merge_on_key
+from ..llm import claude_generate
+from ..tools.catalog_tools import merge_on_key
 
 SYSTEM_PROMPT = """Tu es l'agent de synthèse de DataTalk.
 On te donne la question de l'utilisateur et des données brutes (résultats
