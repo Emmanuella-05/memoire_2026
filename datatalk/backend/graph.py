@@ -60,13 +60,13 @@ def build_graph():
     workflow.add_conditional_edges(
         "classifier",
         _route_after_classifier,
-        {"sql": "sql_agent", "mongo": "mongo_agent", "hybrid": "hybrid_sql"},
+        {"sql": "sql_agent", "mongo": "mongo_agent", "hybrid": "join_planner"},
     )
     workflow.add_edge("sql_agent", "result_merger")
     workflow.add_edge("mongo_agent", "result_merger")
+    workflow.add_edge("join_planner", "hybrid_sql")
     workflow.add_edge("hybrid_sql", "hybrid_mongo")
-    workflow.add_edge("hybrid_mongo", "join_planner")
-    workflow.add_edge("join_planner", "result_merger")
+    workflow.add_edge("hybrid_mongo", "result_merger")
     workflow.add_edge("result_merger", END)
 
     return workflow.compile()
