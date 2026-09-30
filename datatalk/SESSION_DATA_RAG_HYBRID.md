@@ -413,3 +413,26 @@ Corrections appliquées sur `main` :
 Objectif : éviter les `ModuleNotFoundError` liés aux anciens imports `agents`, `tools` ou `llm` lorsque FastAPI importe `backend.main` comme package.
 
 Validation effectuée : relecture des fichiers modifiés sur `main`. Le démarrage Python réel reste à exécuter localement, car aucune exécution end-to-end n'a encore été réalisée dans cette session.
+
+
+## 19. Réparation 4 — contrat d'état HYBRID + environnement virtuel
+
+Corrections appliquées sur `main` :
+
+### Contrat HYBRID
+- Le `Join Planner` est maintenant exécuté avant les agents SQL/Mongo en mode hybride.
+- Le `join_plan` est donc disponible dès la génération des deux requêtes.
+- L'agent SQL reçoit la clé SQLite de jointure et doit la retourner dans ses résultats.
+- L'agent MongoDB reçoit la clé MongoDB de jointure et doit la retourner dans ses résultats.
+- Si une source hybride retourne des lignes sans sa clé de jointure, l'agent déclenche son mécanisme de correction au lieu de produire une fusion incohérente.
+- Le `Result Merger` ne concatène plus arbitrairement les résultats SQL et Mongo en cas de problème de jointure. Il retourne une erreur explicite.
+- Une absence de résultat d'un côté hybride produit une jointure vide, et non une fausse concaténation.
+
+### Environnement virtuel
+Le `.gitignore` contenait déjà les règles `venv/`, `.venv/`, etc., mais cela ne suffisait pas car `datatalk/venv` était déjà suivi par Git.
+
+Les **855 entrées** du répertoire virtuel suivi ont été retirées de l'arbre Git. Le répertoire local n'est pas supprimé par cette opération ; il est simplement retiré du dépôt et restera ignoré grâce au `.gitignore`.
+
+Commit de nettoyage : `ca6a4fcf0aeed0cf6b2bf1170f7b5a03f743d84f`.
+
+La prochaine étape est maintenant la validation réelle du backend et des contrats, avant d'ajouter de nouvelles fonctionnalités.
