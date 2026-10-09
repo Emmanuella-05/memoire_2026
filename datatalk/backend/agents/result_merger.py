@@ -1,69 +1,147 @@
 """Agent result merger : dernier nœud du graphe.
 
-Fusionne les résultats SQL/Mongo (via join_plan si hybride) et rédige la
-réponse finale en langage naturel.
+Fusionne les résultats SQL/Mongo (via join_plan si hybride), constate l'état
+final (ok / aucune donnée / erreur) et rédige la réponse en langage naturel.
+
+Les échecs ne sont jamais déguisés en « aucune donnée » : une erreur de
+requête, de jointure ou de relation inconnue produit un message explicite et
+status = "error".
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from ..llm import claude_generate
-from ..tools.catalog_tools import merge_on_key
+from ..llm import LLMError, claude_generate
+from ..tools.catalog_tools import get_path, merge_results, normalize_key
 
 SYSTEM_PROMPT = """Tu es l'agent de synthèse de DataTalk.
 On te donne la question de l'utilisateur et des données brutes (résultats
 de requêtes SQL et/ou MongoDB). Rédige une réponse claire et concise en
 langage naturel, en français, qui répond directement à la question à
-partir de ces données. Ne mentionne pas les requêtes techniques."""
+partir de ces données. Ne mentionne pas les requêtes techniques.
+Si des remarques techniques sont fournies, signale brièvement celles qui
+limitent la fiabilité de la réponse (lignes sans correspondance, etc.)."""
 
 
-def merge(state: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
-    """Fusionne les résultats sans masquer une erreur de jointure hybride."""
+def _sample_keys(rows: list[dict[str, Any]], key: str, n: int = 3) -> list[str]:
+    keys: list[str] = []
+    for row in rows:
+        value = normalize_key(get_path(row, key))
+        if value is not None and value not in keys:
+            keys.append(value)
+        if len(keys) == n:
+            break
+    return keys
+
+
+def merge(state: dict[str, Any]) -> dict[str, Any]:
+    """Retourne {"rows", "status", "message", "stats"}.
+    status : "ok" | "no_data" | "error" ; message : explication (hors "ok")."""
     source = state.get("source")
-    sql_results = state.get("sql_results") or []
-    mongo_results = state.get("mongo_results") or []
+
+    if state.get("error"):
+        return {"rows": [], "status": "error", "message": state["error"], "stats": None}
 
     if source == "sql":
-        return sql_results, None
+        if state.get("sql_error"):
+            return _failure(f"La requête SQL n'a pas pu être exécutée après {state.get('sql_attempts')} tentative(s) : {state['sql_error']}")
+        rows = state.get("sql_results") or []
+        return _single(rows, "SQLite")
+
     if source == "mongo":
-        return mongo_results, None
+        if state.get("mongo_error"):
+            return _failure(f"Le pipeline MongoDB n'a pas pu être exécuté après {state.get('mongo_attempts')} tentative(s) : {state['mongo_error']}")
+        rows = state.get("mongo_results") or []
+        return _single(rows, "MongoDB")
 
-    join_plan = state.get("join_plan")
-    if not join_plan:
-        return [], "Impossible de fusionner les résultats hybrides : aucune correspondance SQL ↔ MongoDB n'est disponible."
+    # --- hybride ---
+    plan = state.get("join_plan")
+    if not plan:
+        return _failure(state.get("join_error") or "Impossible de fusionner : aucune relation SQL ↔ MongoDB n'est disponible.")
+    problems = []
+    if state.get("sql_error"):
+        problems.append(f"requête SQL : {state['sql_error']}")
+    if state.get("mongo_error"):
+        problems.append(f"pipeline MongoDB : {state['mongo_error']}")
+    if problems:
+        return _failure("La partie hybride a échoué (" + " ; ".join(problems) + ").")
 
-    left_key = join_plan.get("sqlite_key")
-    right_key = join_plan.get("mongo_key")
-    if not left_key or not right_key:
-        return [], "Impossible de fusionner les résultats hybrides : les clés de jointure sont incomplètes."
-
-    if sql_results and not any(left_key in row for row in sql_results):
-        return [], f"Impossible de fusionner les résultats hybrides : la clé SQLite '{left_key}' est absente des résultats."
-    if mongo_results and not any(right_key in row for row in mongo_results):
-        return [], f"Impossible de fusionner les résultats hybrides : la clé MongoDB '{right_key}' est absente des résultats."
+    sql_rows = state.get("sql_results") or []
+    mongo_rows = state.get("mongo_results") or []
+    if not sql_rows or not mongo_rows:
+        empty = "SQLite" if not sql_rows else "MongoDB"
+        return {"rows": [], "status": "no_data", "stats": None,
+                "message": f"Aucune donnée n'a été trouvée côté {empty} pour cette question."}
 
     try:
-        return merge_on_key(
-            sql_results,
-            mongo_results,
-            left_key=left_key,
-            right_key=right_key,
-        ), None
+        merged, stats = merge_results(
+            sql_rows, mongo_rows, plan["sqlite_key"], plan["mongo_key"], plan.get("how", "inner")
+        )
     except Exception as exc:
-        return [], f"Erreur lors de la jointure hybride : {exc}"
+        return _failure(f"Erreur lors de la jointure hybride : {exc}")
+
+    if not merged:
+        return {
+            "rows": [], "status": "no_data", "stats": stats,
+            "message": (
+                f"Les deux sources ont répondu ({len(sql_rows)} ligne(s) SQLite, {len(mongo_rows)} document(s) MongoDB) "
+                f"mais aucune clé ne correspond entre {plan['sqlite_table']}.{plan['sqlite_key']} "
+                f"et {plan['mongo_collection']}.{plan['mongo_key']}. "
+                f"Exemples de clés SQLite : {_sample_keys(sql_rows, plan['sqlite_key'])} ; "
+                f"MongoDB : {_sample_keys(mongo_rows, plan['mongo_key'])}. "
+                "Vérifiez la correspondance, ou les filtres de la question."
+            ),
+        }
+    return {"rows": merged, "status": "ok", "message": None, "stats": stats}
 
 
-def write_answer(question: str, merged_results: list[dict[str, Any]]) -> str:
-    if not merged_results:
-        return "Je n'ai trouvé aucune donnée correspondant à cette question."
-    prompt = f"Question: {question}\n\nDonnées (extrait, max 50 lignes): {merged_results[:50]}"
-    return claude_generate(prompt, system=SYSTEM_PROMPT, max_tokens=800)
+def _failure(message: str) -> dict[str, Any]:
+    return {"rows": [], "status": "error", "message": message, "stats": None}
+
+
+def _single(rows: list[dict[str, Any]], label: str) -> dict[str, Any]:
+    if not rows:
+        return {"rows": [], "status": "no_data", "stats": None,
+                "message": f"Aucune donnée {label} ne correspond à cette question."}
+    return {"rows": rows, "status": "ok", "message": None, "stats": None}
+
+
+def _remarks(stats: dict[str, Any] | None) -> str:
+    if not stats:
+        return ""
+    notes = []
+    if stats["unmatched_left_rows"]:
+        notes.append(f"{stats['unmatched_left_rows']} ligne(s) SQLite sans correspondance MongoDB")
+    if stats["unmatched_right_rows"]:
+        notes.append(f"{stats['unmatched_right_rows']} document(s) MongoDB sans correspondance SQLite")
+    if stats["one_to_many"]:
+        notes.append("relation un-à-plusieurs : une ligne SQLite peut apparaître plusieurs fois")
+    return "\n\nRemarques techniques : " + " ; ".join(notes) if notes else ""
+
+
+def write_answer(question: str, rows: list[dict[str, Any]], stats: dict[str, Any] | None = None) -> str:
+    prompt = f"Question: {question}\n\nDonnées (extrait, max 50 lignes sur {len(rows)}): {rows[:50]}{_remarks(stats)}"
+    try:
+        return claude_generate(prompt, system=SYSTEM_PROMPT, max_tokens=800)
+    except LLMError as exc:
+        # Les données existent : on les renvoie même si la rédaction est impossible.
+        return f"{len(rows)} résultat(s) trouvé(s). La rédaction automatique de la réponse est indisponible ({exc})."
 
 
 def result_merger_node(state: dict[str, Any]) -> dict[str, Any]:
-    """Nœud LangGraph terminal : écrit merged_results et answer."""
-    merged, merge_error = merge(state)
-    if merge_error:
-        return {"merged_results": [], "answer": merge_error}
-    return {"merged_results": merged, "answer": write_answer(state["question"], merged)}
+    """Nœud LangGraph terminal : écrit merged_results, answer, status, error, join_stats."""
+    outcome = merge(state)
+    if outcome["status"] == "ok":
+        answer = write_answer(state["question"], outcome["rows"], outcome["stats"])
+        error = None
+    else:
+        answer = outcome["message"]
+        error = outcome["message"] if outcome["status"] == "error" else None
+    return {
+        "merged_results": outcome["rows"],
+        "answer": answer,
+        "status": outcome["status"],
+        "error": error,
+        "join_stats": outcome["stats"],
+    }

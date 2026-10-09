@@ -144,10 +144,16 @@ def get_index(force_rebuild: bool = False) -> VectorIndex:
 
 
 def reset_index() -> None:
-    """Invalide l'index en mémoire ; il sera reconstruit et resauvegardé
-    au prochain appel de get_index()."""
+    """Invalide l'index en mémoire ET sur disque ; il sera reconstruit à partir
+    de la documentation courante au prochain appel de get_index().
+    (Sans suppression des fichiers, get_index() rechargerait l'ancien index.)"""
     global _index
     _index = None
+    for path in (INDEX_FILE, METADATA_FILE):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def retrieve(question: str, database: str | None = None, k: int = 3) -> list[dict[str, Any]]:

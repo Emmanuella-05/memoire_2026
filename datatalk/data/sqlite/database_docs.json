@@ -1,5 +1,1077 @@
 {
   "database": "sqlite",
-  "description": "Documentation structurée du schéma SQLite de DataTalk.",
-  "tables": []
+  "tables": [
+    {
+      "name": "categories",
+      "columns": [
+        {
+          "name": "category_id",
+          "type": "INTEGER",
+          "nullable": true,
+          "primary_key": true,
+          "default": null,
+          "sample_values": [
+            4,
+            7,
+            5
+          ]
+        },
+        {
+          "name": "name",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "Boissons",
+            "Coffrets cadeaux",
+            "Douceurs et fruits secs"
+          ]
+        },
+        {
+          "name": "description",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "Huiles végétales et beurres alimentaires…",
+            "Dérivés de manioc, maïs, riz et fonio.",
+            "Piments, épices, moutardes et condiments…"
+          ]
+        }
+      ],
+      "foreign_keys": [],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_categories_1",
+          "unique": true
+        }
+      ],
+      "description": "",
+      "row_count": 7
+    },
+    {
+      "name": "customers",
+      "columns": [
+        {
+          "name": "customer_id",
+          "type": "INTEGER",
+          "nullable": true,
+          "primary_key": true,
+          "default": null,
+          "sample_values": [
+            122,
+            41,
+            153
+          ]
+        },
+        {
+          "name": "first_name",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "Hervé",
+            "Bertrand",
+            "Flora"
+          ]
+        },
+        {
+          "name": "last_name",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "Agbodjan",
+            "Amoussou",
+            "Assogba"
+          ]
+        },
+        {
+          "name": "company_name",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "Boulangerie Teranga",
+            "Traiteur Le Palmier",
+            "Restaurant Le Palmier"
+          ]
+        },
+        {
+          "name": "customer_type",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "particulier",
+            "professionnel"
+          ]
+        },
+        {
+          "name": "email",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "abdoulaye.kpadonou@yahoo.fr",
+            "aicha.akplogan@yahoo.fr",
+            "aicha.hountondji@gmail.com"
+          ]
+        },
+        {
+          "name": "phone",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "+229 0172800137",
+            "+229 0162277089",
+            "+229 0182981487"
+          ]
+        },
+        {
+          "name": "city",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "Cotonou",
+            "Parakou",
+            "Abomey-Calavi"
+          ]
+        },
+        {
+          "name": "country",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "Bénin",
+            "France",
+            "Togo"
+          ]
+        },
+        {
+          "name": "registration_date",
+          "type": "DATE",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "2023-06-05",
+            "2023-06-23",
+            "2023-06-24"
+          ]
+        },
+        {
+          "name": "loyalty_tier",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "bronze",
+            "or",
+            "argent"
+          ]
+        }
+      ],
+      "foreign_keys": [],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_customers_1",
+          "unique": true
+        }
+      ],
+      "description": "",
+      "row_count": 160
+    },
+    {
+      "name": "deliveries",
+      "columns": [
+        {
+          "name": "delivery_id",
+          "type": "INTEGER",
+          "nullable": true,
+          "primary_key": true,
+          "default": null,
+          "sample_values": [
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "name": "order_id",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            5,
+            6,
+            8
+          ]
+        },
+        {
+          "name": "carrier",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "Livraison BéninTerroir",
+            "Colis Express Bénin",
+            "La Poste du Bénin"
+          ]
+        },
+        {
+          "name": "tracking_number",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "BT000005122",
+            "BT000006635",
+            "BT000008926"
+          ]
+        },
+        {
+          "name": "shipped_date",
+          "type": "DATE",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "2024-02-10",
+            "2024-02-17",
+            "2024-02-29"
+          ]
+        },
+        {
+          "name": "promised_date",
+          "type": "DATE",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "2024-02-12",
+            "2024-02-14",
+            "2024-02-19"
+          ]
+        },
+        {
+          "name": "delivered_date",
+          "type": "DATE",
+          "nullable": true,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "2024-02-12",
+            "2024-02-15",
+            "2024-02-20"
+          ]
+        },
+        {
+          "name": "delivery_status",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "livree",
+            "en_transit"
+          ]
+        }
+      ],
+      "foreign_keys": [
+        {
+          "column": "order_id",
+          "references_table": "orders",
+          "references_column": "order_id"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_deliveries_1",
+          "unique": true
+        }
+      ],
+      "description": "",
+      "row_count": 251
+    },
+    {
+      "name": "employees",
+      "columns": [
+        {
+          "name": "employee_id",
+          "type": "INTEGER",
+          "nullable": true,
+          "primary_key": true,
+          "default": null,
+          "sample_values": [
+            11,
+            2,
+            9
+          ]
+        },
+        {
+          "name": "first_name",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "Fidèle",
+            "Carine",
+            "Judicaël"
+          ]
+        },
+        {
+          "name": "last_name",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "Houngbo",
+            "Agbodjan",
+            "Tokpanou"
+          ]
+        },
+        {
+          "name": "email",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "aicha.moussa@beninterroir.bj",
+            "carine.agbodjan@beninterroir.bj",
+            "chantal.zinsou@beninterroir.bj"
+          ]
+        },
+        {
+          "name": "role",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "directeur_general",
+            "responsable_logistique",
+            "magasinier"
+          ]
+        },
+        {
+          "name": "store_id",
+          "type": "INTEGER",
+          "nullable": true,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            4,
+            1,
+            2
+          ]
+        },
+        {
+          "name": "manager_id",
+          "type": "INTEGER",
+          "nullable": true,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            1,
+            2,
+            5
+          ]
+        },
+        {
+          "name": "hire_date",
+          "type": "DATE",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "2021-06-01",
+            "2021-09-01",
+            "2021-10-15"
+          ]
+        }
+      ],
+      "foreign_keys": [
+        {
+          "column": "manager_id",
+          "references_table": "employees",
+          "references_column": "employee_id"
+        },
+        {
+          "column": "store_id",
+          "references_table": "stores",
+          "references_column": "store_id"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_employees_1",
+          "unique": true
+        }
+      ],
+      "description": "",
+      "row_count": 15
+    },
+    {
+      "name": "order_items",
+      "columns": [
+        {
+          "name": "order_item_id",
+          "type": "INTEGER",
+          "nullable": true,
+          "primary_key": true,
+          "default": null,
+          "sample_values": [
+            10,
+            30,
+            39
+          ]
+        },
+        {
+          "name": "order_id",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "name": "product_id",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "name": "quantity",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            1,
+            48,
+            24
+          ]
+        },
+        {
+          "name": "unit_price",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            2500,
+            1500,
+            3500
+          ]
+        },
+        {
+          "name": "discount_pct",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            0,
+            10,
+            3
+          ]
+        },
+        {
+          "name": "line_total",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            2500,
+            1500,
+            151200
+          ]
+        }
+      ],
+      "foreign_keys": [
+        {
+          "column": "product_id",
+          "references_table": "products",
+          "references_column": "product_id"
+        },
+        {
+          "column": "order_id",
+          "references_table": "orders",
+          "references_column": "order_id"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_items_product",
+          "unique": false
+        },
+        {
+          "name": "idx_items_order",
+          "unique": false
+        },
+        {
+          "name": "sqlite_autoindex_order_items_1",
+          "unique": true
+        }
+      ],
+      "description": "",
+      "row_count": 1764
+    },
+    {
+      "name": "orders",
+      "columns": [
+        {
+          "name": "order_id",
+          "type": "INTEGER",
+          "nullable": true,
+          "primary_key": true,
+          "default": null,
+          "sample_values": [
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "name": "customer_id",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "name": "employee_id",
+          "type": "INTEGER",
+          "nullable": true,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            6,
+            9,
+            7
+          ]
+        },
+        {
+          "name": "store_id",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            1,
+            2,
+            4
+          ]
+        },
+        {
+          "name": "order_date",
+          "type": "DATE",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "2024-01-22",
+            "2024-02-03",
+            "2024-02-04"
+          ]
+        },
+        {
+          "name": "channel",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "boutique",
+            "web",
+            "mobile"
+          ]
+        },
+        {
+          "name": "delivery_mode",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "retrait_boutique",
+            "livraison"
+          ]
+        },
+        {
+          "name": "payment_method",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "especes",
+            "mobile_money",
+            "carte_bancaire"
+          ]
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "livree",
+            "annulee",
+            "expediee"
+          ]
+        },
+        {
+          "name": "cancellation_reason",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "demande_client",
+            "paiement_non_recu",
+            "rupture_stock"
+          ]
+        },
+        {
+          "name": "completed_date",
+          "type": "DATE",
+          "nullable": true,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "2024-01-22",
+            "2024-02-03",
+            "2024-02-04"
+          ]
+        },
+        {
+          "name": "shipping_fee",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            0,
+            1500,
+            8000
+          ]
+        },
+        {
+          "name": "total_amount",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            4000,
+            201150,
+            77760
+          ]
+        }
+      ],
+      "foreign_keys": [
+        {
+          "column": "store_id",
+          "references_table": "stores",
+          "references_column": "store_id"
+        },
+        {
+          "column": "employee_id",
+          "references_table": "employees",
+          "references_column": "employee_id"
+        },
+        {
+          "column": "customer_id",
+          "references_table": "customers",
+          "references_column": "customer_id"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_orders_date",
+          "unique": false
+        },
+        {
+          "name": "idx_orders_customer",
+          "unique": false
+        }
+      ],
+      "description": "",
+      "row_count": 598
+    },
+    {
+      "name": "products",
+      "columns": [
+        {
+          "name": "product_id",
+          "type": "INTEGER",
+          "nullable": true,
+          "primary_key": true,
+          "default": null,
+          "sample_values": [
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "name": "sku",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "BT-01-001",
+            "BT-01-002",
+            "BT-01-003"
+          ]
+        },
+        {
+          "name": "name",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "Huile de palme rouge 1 L",
+            "Huile de palme rouge 5 L",
+            "Huile de coco vierge 500 ml"
+          ]
+        },
+        {
+          "name": "category_id",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "name": "supplier_id",
+          "type": "INTEGER",
+          "nullable": true,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            1,
+            2,
+            11
+          ]
+        },
+        {
+          "name": "unit_price",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            2500,
+            11000,
+            3500
+          ]
+        },
+        {
+          "name": "cost_price",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            1640,
+            5510,
+            1760
+          ]
+        },
+        {
+          "name": "stock_quantity",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            444,
+            116,
+            311
+          ]
+        },
+        {
+          "name": "reorder_level",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            40,
+            20,
+            60
+          ]
+        },
+        {
+          "name": "launch_date",
+          "type": "DATE",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "2023-06-01",
+            "2025-02-01",
+            "2025-04-01"
+          ]
+        },
+        {
+          "name": "is_active",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            1,
+            0
+          ]
+        }
+      ],
+      "foreign_keys": [
+        {
+          "column": "supplier_id",
+          "references_table": "suppliers",
+          "references_column": "supplier_id"
+        },
+        {
+          "column": "category_id",
+          "references_table": "categories",
+          "references_column": "category_id"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_products_category",
+          "unique": false
+        },
+        {
+          "name": "sqlite_autoindex_products_1",
+          "unique": true
+        }
+      ],
+      "description": "",
+      "row_count": 38
+    },
+    {
+      "name": "stores",
+      "columns": [
+        {
+          "name": "store_id",
+          "type": "INTEGER",
+          "nullable": true,
+          "primary_key": true,
+          "default": null,
+          "sample_values": [
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "name": "name",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "Boutique Cotonou Ganhi",
+            "Boutique Porto-Novo",
+            "Boutique Parakou"
+          ]
+        },
+        {
+          "name": "city",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "Cotonou",
+            "Porto-Novo",
+            "Parakou"
+          ]
+        },
+        {
+          "name": "store_type",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "boutique",
+            "entrepot"
+          ]
+        },
+        {
+          "name": "opening_date",
+          "type": "DATE",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "2022-03-01",
+            "2022-11-15",
+            "2023-04-10"
+          ]
+        }
+      ],
+      "foreign_keys": [],
+      "indexes": [],
+      "description": "",
+      "row_count": 4
+    },
+    {
+      "name": "suppliers",
+      "columns": [
+        {
+          "name": "supplier_id",
+          "type": "INTEGER",
+          "nullable": true,
+          "primary_key": true,
+          "default": null,
+          "sample_values": [
+            9,
+            6,
+            8
+          ]
+        },
+        {
+          "name": "name",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "Anacardes de Savè",
+            "Apiculteurs de Savalou",
+            "Cacao et Café de Kpalimé"
+          ]
+        },
+        {
+          "name": "supplier_type",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "cooperative",
+            "entreprise"
+          ]
+        },
+        {
+          "name": "city",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "Allada",
+            "Natitingou",
+            "Bohicon"
+          ]
+        },
+        {
+          "name": "country",
+          "type": "TEXT",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "Bénin",
+            "Togo"
+          ]
+        },
+        {
+          "name": "contact_email",
+          "type": "TEXT",
+          "nullable": true,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "contact@palmiers-allada.bj",
+            "karite.natitingou@gmail.com",
+            "commercial@garidor.bj"
+          ]
+        },
+        {
+          "name": "partnership_start",
+          "type": "DATE",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            "2021-08-10",
+            "2021-10-05",
+            "2021-09-20"
+          ]
+        },
+        {
+          "name": "is_active",
+          "type": "INTEGER",
+          "nullable": false,
+          "primary_key": false,
+          "default": null,
+          "sample_values": [
+            1,
+            0
+          ]
+        }
+      ],
+      "foreign_keys": [],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_suppliers_1",
+          "unique": true
+        }
+      ],
+      "description": "",
+      "row_count": 11
+    }
+  ]
 }

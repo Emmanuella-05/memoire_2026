@@ -4,33 +4,34 @@ corrige en cas de rejet ou d'erreur.
 
 Symétrique de sql_agent.py.
 
-Pipeline par tentative :
-  1. génération (ou correction si tentative précédente rejetée/en échec)
-  2. validation déterministe : aucune étape d'écriture/admin
-     (tools.mongo_tools.is_pipeline_safe)
-  3. validation sémantique : le LLM vérifie que le pipeline répond bien à la
-     question et référence une collection/des champs qui existent
-  4. exécution, seulement si les deux validations passent
+Pipeline par tentative (3 au maximum) :
+  1. génération (ou correction de la tentative précédente)
+  2. validation déterministe : collection connue, aucun opérateur d'écriture,
+     de code JavaScript ou d'administration, à aucune profondeur
+     (tools.mongo_tools.pipeline_rejection_reason)
+  3. validation sémantique : le LLM vérifie que le pipeline répond à la question
+  4. exécution, seulement si les validations passent
 """
 
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 
-from ..llm import claude_generate
-from ..tools.catalog_tools import load_database_docs
+from ..llm import LLMError, claude_json
+from ..tools.catalog_tools import DataSourceUnavailable, get_path, load_database_docs
+from ..tools.mongo_tools import collection_rejection_reason, execute_mongo, pipeline_rejection_reason
 from ..tools.rag_tools import context as rag_context
-from ..tools.mongo_tools import execute_mongo, is_pipeline_safe
 
 MAX_ATTEMPTS = 3
+_INFRA_ERRORS = (LLMError, DataSourceUnavailable)
 
 GENERATE_SYSTEM_PROMPT = """Tu es l'agent MongoDB de DataTalk.
 Tu reçois le schéma inféré des collections MongoDB disponibles, du contexte
 documentaire optionnel et une question en langage naturel. Tu dois produire
-UN pipeline d'agrégation MongoDB (lecture seule, aucune étape $out/$merge)
-qui répond à la question.
+UN pipeline d'agrégation MongoDB (lecture seule : aucune étape $out/$merge,
+aucun $function/$accumulator/$where) qui répond à la question. Chaque étape
+du pipeline contient un seul opérateur.
 
 Réponds STRICTEMENT avec un JSON de la forme :
 {"collection": "<nom_collection>", "pipeline": [<étapes d'agrégation>]}
@@ -40,24 +41,33 @@ VALIDATE_SYSTEM_PROMPT = """Tu es le validateur MongoDB de DataTalk.
 On te donne le schéma des collections MongoDB, une question, et un pipeline
 d'agrégation généré pour y répondre. Vérifie que :
 - le pipeline répond effectivement à la question posée
-- la collection et les champs référencés existent dans le schéma
+- les champs référencés existent dans le schéma
 - les comparaisons/filtres sont cohérents avec le type de chaque champ
   (ex: pas de comparaison numérique sur un champ string)
-- le pipeline est syntaxiquement plausible
+- les étapes ($group, $lookup, $unwind...) ont un sens métier
 
 Réponds STRICTEMENT avec un JSON de la forme :
 {"valid": true} ou {"valid": false, "issues": "<explication courte>"}
 Aucun texte hors de ce JSON."""
 
-FIX_PROMPT_TEMPLATE = """Le pipeline MongoDB suivant a été rejeté :
+FIX_PROMPT_TEMPLATE = """Schéma MongoDB:
+{schema}
+
+Question: {question}
+
+Le pipeline MongoDB suivant a été rejeté :
 Collection: {collection}
 Pipeline: {pipeline}
 
 Raison :
 {issue}
-
+{join_requirement}
 Corrige le pipeline. Réponds STRICTEMENT avec le même format JSON :
 {{"collection": "<nom_collection>", "pipeline": [<étapes corrigées>]}}"""
+
+
+def _known_collections() -> list[str]:
+    return [c.get("name", "") for c in load_database_docs("mongodb").get("collections", []) if c.get("name")]
 
 
 def _schema_summary() -> str:
@@ -72,116 +82,119 @@ def _schema_summary() -> str:
     return "\n".join(lines) if lines else "Aucune collection documentée."
 
 
-def _extract_json(raw: str) -> dict[str, Any]:
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not match:
-            raise ValueError(f"Could not extract JSON from model output: {raw!r}")
-        return json.loads(match.group(0))
+def _join_requirement(join_plan: dict[str, Any] | None) -> str:
+    if not join_plan:
+        return ""
+    return (
+        "\n\nContrainte HYBRID : ce pipeline sera joint à SQLite. "
+        f"Il doit impérativement retourner, sans l'agréger, le champ de jointure "
+        f"'{join_plan.get('mongo_key')}' (collection {join_plan.get('mongo_collection')}) dans ses résultats."
+    )
+
+
+def _read_pipeline(parsed: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    collection, pipeline = parsed.get("collection"), parsed.get("pipeline")
+    if not isinstance(collection, str) or not isinstance(pipeline, list):
+        raise ValueError("La réponse du modèle doit contenir 'collection' (texte) et 'pipeline' (liste).")
+    return collection, pipeline
 
 
 def generate_pipeline(question: str, join_plan: dict[str, Any] | None = None) -> tuple[str, list[dict[str, Any]]]:
-    join_requirement = ""
-    if join_plan:
-        join_requirement = (
-            "\n\nContrainte HYBRID : ce pipeline sera joint à SQLite. "
-            f"Il doit impérativement retourner le champ MongoDB "
-            f"'{join_plan.get('mongo_key')}' dans ses résultats."
-        )
     prompt = (
         f"Schéma MongoDB:\n{_schema_summary()}\n\n"
         f"Contexte documentaire:\n{rag_context(question, database='mongodb')}\n\n"
-        f"Question: {question}{join_requirement}"
+        f"Question: {question}{_join_requirement(join_plan)}"
     )
-    raw = claude_generate(prompt, system=GENERATE_SYSTEM_PROMPT, max_tokens=500)
-    parsed = _extract_json(raw)
-    return parsed["collection"], parsed["pipeline"]
+    return _read_pipeline(claude_json(prompt, system=GENERATE_SYSTEM_PROMPT, max_tokens=700))
+
+
+def fix_pipeline(question: str, collection: str, pipeline: list[dict[str, Any]], issue: str,
+                 join_plan: dict[str, Any] | None = None) -> tuple[str, list[dict[str, Any]]]:
+    prompt = FIX_PROMPT_TEMPLATE.format(
+        schema=_schema_summary(), question=question, collection=collection,
+        pipeline=json.dumps(pipeline, ensure_ascii=False, default=str), issue=issue,
+        join_requirement=_join_requirement(join_plan),
+    )
+    return _read_pipeline(claude_json(prompt, system=GENERATE_SYSTEM_PROMPT, max_tokens=700))
 
 
 def validate_pipeline(question: str, collection: str, pipeline: list[dict[str, Any]]) -> dict[str, Any]:
-    """Validation en deux temps : déterministe (pas d'étape d'écriture/admin)
-    puis sémantique (LLM, contre le schéma et la question)."""
-    if not is_pipeline_safe(pipeline):
-        return {"valid": False, "issues": "Le pipeline contient une étape d'écriture ou d'administration interdite."}
+    """Validation en deux temps : déterministe (collection connue, aucun
+    opérateur interdit) puis sémantique (LLM)."""
+    known = _known_collections()
+    reason = collection_rejection_reason(collection, known) or pipeline_rejection_reason(pipeline, known)
+    if reason:
+        return {"valid": False, "issues": reason}
 
     prompt = (
         f"Schéma MongoDB:\n{_schema_summary()}\n\nQuestion: {question}\n\n"
-        f"Collection: {collection}\nPipeline: {pipeline}"
+        f"Collection: {collection}\nPipeline: {json.dumps(pipeline, ensure_ascii=False, default=str)}"
     )
-    raw = claude_generate(prompt, system=VALIDATE_SYSTEM_PROMPT, max_tokens=300)
     try:
-        parsed = _extract_json(raw)
-        if parsed.get("valid") is True:
-            return {"valid": True, "issues": None}
-        return {"valid": False, "issues": parsed.get("issues", "Pipeline jugé invalide par le validateur.")}
+        parsed = claude_json(prompt, system=VALIDATE_SYSTEM_PROMPT, max_tokens=300)
     except ValueError:
-        # Réponse du validateur illisible : on ne bloque pas indéfiniment,
-        # on laisse passer à l'exécution (execute_mongo reste le garde-fou final).
+        # Validateur illisible : le pipeline a déjà passé les contrôles
+        # déterministes et execute_mongo reste le garde-fou final.
         return {"valid": True, "issues": None}
+    if parsed.get("valid") is True:
+        return {"valid": True, "issues": None}
+    return {"valid": False, "issues": parsed.get("issues") or "Pipeline jugé invalide par le validateur."}
 
 
 def run(question: str, join_plan: dict[str, Any] | None = None) -> dict[str, Any]:
     """Génère -> valide -> exécute, avec correction à chaque rejet ou erreur,
     jusqu'à MAX_ATTEMPTS."""
-    collection, pipeline = generate_pipeline(question, join_plan)
-    last_issue: str | None = None
-
+    current: tuple[str, list[dict[str, Any]]] | None = None
+    issue: str | None = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            current = (
+                generate_pipeline(question, join_plan) if current is None
+                else fix_pipeline(question, current[0], current[1], issue or "", join_plan)
+            )
+        except _INFRA_ERRORS:
+            raise
+        except Exception as exc:
+            issue = f"Génération impossible : {exc}"
+            continue
+        collection, pipeline = current
+
         validation = validate_pipeline(question, collection, pipeline)
         if not validation["valid"]:
-            last_issue = validation["issues"]
-            if attempt == MAX_ATTEMPTS:
-                break
-            raw = claude_generate(
-                FIX_PROMPT_TEMPLATE.format(collection=collection, pipeline=pipeline, issue=last_issue),
-                system=GENERATE_SYSTEM_PROMPT,
-                max_tokens=500,
-            )
-            parsed = _extract_json(raw)
-            collection, pipeline = parsed["collection"], parsed["pipeline"]
+            issue = validation["issues"]
             continue
 
         try:
-            rows = execute_mongo(collection, pipeline)
-            if join_plan and rows and not any(join_plan.get("mongo_key") in row for row in rows):
-                raise ValueError(
-                    f"Le pipeline MongoDB ne retourne pas la clé de jointure "
-                    f"'{join_plan.get('mongo_key')}'."
-                )
-            return {
-                "mongo_collection": collection,
-                "mongo_pipeline": pipeline,
-                "mongo_results": rows,
-                "mongo_error": None,
-                "mongo_attempts": attempt,
-            }
+            rows = execute_mongo(collection, pipeline, _known_collections())
+        except _INFRA_ERRORS:
+            raise
         except Exception as exc:
-            last_issue = str(exc)
-            if attempt == MAX_ATTEMPTS:
-                break
-            raw = claude_generate(
-                FIX_PROMPT_TEMPLATE.format(collection=collection, pipeline=pipeline, issue=last_issue),
-                system=GENERATE_SYSTEM_PROMPT,
-                max_tokens=500,
-            )
-            parsed = _extract_json(raw)
-            collection, pipeline = parsed["collection"], parsed["pipeline"]
+            issue = str(exc)
+            continue
+
+        key = join_plan.get("mongo_key") if join_plan else None
+        if key and rows and not any(get_path(row, key) is not None for row in rows):
+            issue = f"Le pipeline MongoDB ne retourne pas la clé de jointure '{key}'."
+            continue
+
+        return {
+            "mongo_collection": collection,
+            "mongo_pipeline": pipeline,
+            "mongo_results": rows,
+            "mongo_error": None,
+            "mongo_attempts": attempt,
+        }
 
     return {
-        "mongo_collection": collection,
-        "mongo_pipeline": pipeline,
+        "mongo_collection": current[0] if current else None,
+        "mongo_pipeline": current[1] if current else None,
         "mongo_results": [],
-        "mongo_error": last_issue,
+        "mongo_error": issue,
         "mongo_attempts": MAX_ATTEMPTS,
     }
 
 
 def mongo_agent_node(state: dict[str, Any]) -> dict[str, Any]:
-    """Nœud LangGraph : lit state['question'], écrit mongo_collection/mongo_pipeline/mongo_results/mongo_error.
-
-    Ne renvoie que ces clés (pas tout `state`) : requis par LangGraph pour le
-    fan-out parallèle avec sql_agent en mode hybride (sinon conflit
-    d'écriture concurrente sur 'question')."""
+    """Nœud LangGraph : lit state['question'] (et join_plan en mode hybride),
+    écrit mongo_collection/mongo_pipeline/mongo_results/mongo_error/mongo_attempts."""
     return run(state["question"], state.get("join_plan"))

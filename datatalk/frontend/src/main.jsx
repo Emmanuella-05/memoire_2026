@@ -4,6 +4,29 @@ import "./style.css";
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
+// Appel API commun : renvoie le JSON ou lève une Error au message lisible
+// (backend injoignable, 409 source absente, 422 entrée invalide, 503 LLM...).
+async function api(path, options) {
+  let response;
+  try {
+    response = await fetch(`${API_URL}${path}`, options);
+  } catch {
+    throw new Error("Backend injoignable. Vérifiez qu'il est lancé et que VITE_API_URL est correct.");
+  }
+  let data = null;
+  try {
+    data = await response.json();
+  } catch {
+    // réponse non JSON
+  }
+  if (!response.ok) {
+    let detail = data?.detail;
+    if (Array.isArray(detail)) detail = detail.map((d) => d.msg).join(" ; ");
+    throw new Error(detail || `Erreur API ${response.status}`);
+  }
+  return data;
+}
+
 function UploadBox({ target, label, accept, onUploaded }) {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
@@ -16,9 +39,7 @@ function UploadBox({ target, label, accept, onUploaded }) {
     try {
       const body = new FormData();
       body.append("file", file);
-      const response = await fetch(`${API_URL}/upload/${target}`, { method: "POST", body });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.detail || `API ${response.status}`);
+      const data = await api(`/upload/${target}`, { method: "POST", body });
       setMessage(`✓ ${file.name}`);
       onUploaded?.(data);
     } catch (err) {
@@ -38,24 +59,155 @@ function UploadBox({ target, label, accept, onUploaded }) {
   );
 }
 
+function DataTable({ rows }) {
+  if (!rows?.length) return null;
+  const shown = rows.slice(0, 50);
+  const columns = [...new Set(shown.flatMap((row) => Object.keys(row)))];
+  const cell = (v) => (v !== null && typeof v === "object" ? JSON.stringify(v) : String(v ?? ""));
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>{columns.map((c) => <th key={c}>{c}</th>)}</tr>
+        </thead>
+        <tbody>
+          {shown.map((row, i) => (
+            <tr key={i}>{columns.map((c) => <td key={c}>{cell(row[c])}</td>)}</tr>
+          ))}
+        </tbody>
+      </table>
+      {rows.length > shown.length && <small>{shown.length} lignes affichées sur {rows.length}.</small>}
+    </div>
+  );
+}
+
+function Catalog({ schemas, mappings, onSetStatus }) {
+  const tables = schemas?.sqlite?.tables || [];
+  const collections = schemas?.mongodb?.collections || [];
+  if (!tables.length && !collections.length) return null;
+  const both = tables.length > 0 && collections.length > 0;
+  return (
+    <details className="analysis" open>
+      <summary>Analyse automatique</summary>
+      <div className="catalog">
+        {tables.length > 0 && (
+          <div>
+            <h3>SQLite</h3>
+            <ul>{tables.map((t) => <li key={t.name}><b>{t.name}</b> · {t.columns.length} colonnes · {t.row_count ?? "?"} lignes</li>)}</ul>
+          </div>
+        )}
+        {collections.length > 0 && (
+          <div>
+            <h3>MongoDB</h3>
+            <ul>{collections.map((c) => <li key={c.name}><b>{c.name}</b> · {c.fields.length} champs · {c.document_count ?? "?"} documents</li>)}</ul>
+          </div>
+        )}
+      </div>
+
+      {both && (
+        <>
+          <h3>Correspondances SQL ↔ MongoDB</h3>
+          {mappings.length ? (
+            <ul className="mappings">
+              {mappings.map((m, i) => (
+                <li key={i} className={`mapping ${m.status}`}>
+                  <span>
+                    <b>{m.entity}</b> : {m.sqlite.table}.{m.sqlite.key} ↔ {m.mongodb.collection}.{m.mongodb.key}
+                    {m.confidence != null && <small> · confiance {m.confidence}</small>}
+                    <small> · {m.status === "suggested" ? "suggérée" : m.status === "confirmed" ? "confirmée" : "rejetée"}</small>
+                  </span>
+                  <span className="actions">
+                    {m.status !== "confirmed" && <button type="button" onClick={() => onSetStatus(i, "confirmed")}>Confirmer</button>}
+                    {m.status !== "rejected" && <button type="button" onClick={() => onSetStatus(i, "rejected")}>Rejeter</button>}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="hint">
+              Aucune correspondance détectée. Les questions qui combinent les deux bases ne pourront pas être traitées ;
+              celles qui concernent une seule base fonctionnent normalement.
+            </p>
+          )}
+        </>
+      )}
+    </details>
+  );
+}
+
+function Trace({ execution, source }) {
+  if (!execution) return null;
+  const { sql_query, mongo_collection, mongo_pipeline, join_plan, join_stats, join_error, attempts, classifier_reason } = execution;
+  return (
+    <details>
+      <summary>Traçabilité</summary>
+      <ul className="trace">
+        {source && <li><b>Source :</b> {source}{classifier_reason ? ` — ${classifier_reason}` : ""}</li>}
+        {sql_query && <li><b>SQL :</b> <code>{sql_query}</code></li>}
+        {mongo_pipeline && <li><b>MongoDB :</b> {mongo_collection} <code>{JSON.stringify(mongo_pipeline)}</code></li>}
+        {join_plan && (
+          <li>
+            <b>Jointure :</b> {join_plan.sqlite_table}.{join_plan.sqlite_key} ↔ {join_plan.mongo_collection}.{join_plan.mongo_key} ({join_plan.how})
+          </li>
+        )}
+        {join_error && <li><b>Relation :</b> {join_error}</li>}
+        {join_stats && (
+          <li>
+            <b>Fusion :</b> {join_stats.joined_rows} lignes · {join_stats.unmatched_left_rows} SQL sans correspondance · {join_stats.unmatched_right_rows} MongoDB sans correspondance
+            {join_stats.one_to_many ? " · relation un-à-plusieurs" : ""}
+          </li>
+        )}
+        {(attempts?.sql || attempts?.mongo) && (
+          <li><b>Tentatives :</b> {attempts.sql ? `SQL ${attempts.sql}` : ""} {attempts.mongo ? `MongoDB ${attempts.mongo}` : ""}</li>
+        )}
+      </ul>
+      <details>
+        <summary>Données brutes</summary>
+        <pre>{JSON.stringify(execution, null, 2)}</pre>
+      </details>
+    </details>
+  );
+}
+
+function Result({ result }) {
+  const status = result.status || "ok";
+  return (
+    <section className={`result ${status}`}>
+      <h2>
+        Résultat{" "}
+        <span className={`badge ${status}`}>
+          {status === "ok" ? "OK" : status === "no_data" ? "Aucune donnée" : "Erreur"}
+        </span>
+      </h2>
+      {result.answer && <p className="answer">{result.answer}</p>}
+      <DataTable rows={result.data} />
+      <Trace execution={result.execution} source={result.source} />
+    </section>
+  );
+}
+
 function App() {
   const [question, setQuestion] = useState("");
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [workspace, setWorkspace] = useState(null);
+  const [schemas, setSchemas] = useState(null);
+  const [mappings, setMappings] = useState([]);
 
-  async function refreshWorkspace() {
+  async function refreshCatalog() {
     try {
-      const response = await fetch(`${API_URL}/workspace`);
-      if (response.ok) setWorkspace(await response.json());
-    } catch {
-      // The query action will surface backend connectivity errors.
+      const [ws, sc, mp] = await Promise.all([api("/workspace"), api("/docs/schemas"), api("/mappings")]);
+      setWorkspace(ws);
+      setSchemas(sc);
+      setMappings(mp.mappings || []);
+    } catch (err) {
+      setError(err.message);
     }
   }
 
   useEffect(() => {
-    refreshWorkspace();
+    refreshCatalog();
   }, []);
 
   async function ask() {
@@ -64,14 +216,11 @@ function App() {
     setError("");
     setResult(null);
     try {
-      const response = await fetch(`${API_URL}/query`, {
+      setResult(await api("/query", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question: question.trim() }),
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.detail || `API ${response.status}`);
-      setResult(data);
+      }));
     } catch (err) {
       setError(`Impossible d'interroger DataTalk : ${err.message}`);
     } finally {
@@ -82,18 +231,30 @@ function App() {
   async function reanalyze() {
     setError("");
     try {
-      const response = await fetch(`${API_URL}/analyze`, { method: "POST" });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.detail || `API ${response.status}`);
-      setWorkspace(data.workspace);
+      await api("/analyze", { method: "POST" });
+      await refreshCatalog();
     } catch (err) {
       setError(`Analyse impossible : ${err.message}`);
     }
   }
 
-  const mappings = workspace?.mappings;
+  async function setMappingStatus(index, status) {
+    setError("");
+    const updated = mappings.map((m, i) => (i === index ? { ...m, status } : m));
+    try {
+      const data = await api("/mappings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mappings: updated }),
+      });
+      setMappings(data.mappings);
+    } catch (err) {
+      setError(`Correspondance non enregistrée : ${err.message}`);
+    }
+  }
+
   const status = workspace
-    ? `RAG : ${workspace.rag_documents} documents indexés`
+    ? `MongoDB : ${workspace.mongodb_engine === "server" ? "serveur" : "moteur embarqué"} · RAG : ${workspace.rag_documents ?? "?"} documents indexés${workspace.claude_configured ? "" : " · clé Claude absente"}`
     : "Connexion au workspace…";
 
   return (
@@ -107,29 +268,18 @@ function App() {
         <section className="uploads">
           <h2>Configurer les données</h2>
           <p className="hint">
-            Chargez les données. DataTalk inspecte automatiquement les schémas,
-            génère la documentation RAG et propose les correspondances SQL ↔ MongoDB.
+            Chargez la base dont vous avez besoin : SQLite, MongoDB, ou les deux. DataTalk inspecte
+            automatiquement les schémas et génère la documentation ; si les deux bases sont chargées,
+            il propose aussi les correspondances SQL ↔ MongoDB.
           </p>
 
           <div className="upload-grid">
-            <UploadBox
-              target="sqlite-db"
-              label="Base SQLite"
-              accept=".db,.sqlite,.sqlite3"
-              onUploaded={(data) => { setWorkspace(data.workspace); setError(""); }}
-            />
-            <UploadBox
-              target="mongodb-data"
-              label="Données MongoDB (JSON)"
-              accept=".json"
-              onUploaded={(data) => { setWorkspace(data.workspace); setError(""); }}
-            />
-            <UploadBox
-              target="business-rules"
-              label="Règles métier (optionnel)"
-              accept=".json,.txt,.md"
-              onUploaded={(data) => { setWorkspace(data.workspace); setError(""); }}
-            />
+            <UploadBox target="sqlite-db" label="Base SQLite" accept=".db,.sqlite,.sqlite3"
+              onUploaded={() => { setError(""); refreshCatalog(); }} />
+            <UploadBox target="mongodb-data" label="Données MongoDB (JSON)" accept=".json"
+              onUploaded={() => { setError(""); refreshCatalog(); }} />
+            <UploadBox target="business-rules" label="Règles métier (optionnel)" accept=".json,.txt,.md"
+              onUploaded={() => { setError(""); refreshCatalog(); }} />
           </div>
 
           <div className="workspace-status">
@@ -137,16 +287,7 @@ function App() {
             <button type="button" onClick={reanalyze}>Réanalyser</button>
           </div>
 
-          {workspace && (
-            <details className="analysis">
-              <summary>Analyse automatique</summary>
-              <p>
-                SQLite : {workspace.sqlite_database ? "disponible" : "absent"} ·{" "}
-                MongoDB : {workspace.mongodb_docs ? "documenté" : "absent"} ·{" "}
-                Correspondances : {mappings ? "catalogue généré" : "non généré"}
-              </p>
-            </details>
-          )}
+          <Catalog schemas={schemas} mappings={mappings} onSetStatus={setMappingStatus} />
         </section>
 
         <div className="query-row">
@@ -168,20 +309,7 @@ function App() {
         </div>
 
         {error && <p className="error">{error}</p>}
-
-        {result && (
-          <section className="result">
-            <h2>Résultat</h2>
-            {result.answer && <p>{result.answer}</p>}
-            {result.data && <pre>{JSON.stringify(result.data, null, 2)}</pre>}
-            {result.execution && (
-              <details>
-                <summary>Traçabilité</summary>
-                <pre>{JSON.stringify(result.execution, null, 2)}</pre>
-              </details>
-            )}
-          </section>
-        )}
+        {result && <Result result={result} />}
       </section>
     </main>
   );
