@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -31,21 +32,26 @@ from .catalog_tools import (
     SQLITE_DOCS,
     DataSourceUnavailable,
     _write_json,
+    clear_mongo_connection,
     load_all_mappings,
     mapping_is_valid,
+    mongo_connection,
     normalize_key,
+    save_mongo_connection,
 )
 from .mongo_tools import (
     analyze_mongo_payload,
+    check_mongo_connection,
     iter_scalar_values,
     load_payload_into_server,
-    sample_live_collections,
+    read_live_mongodb,
     validate_mongo_payload,
 )
 from .sql_tools import _connect_ro, analyze_sqlite_schema
 
 SQLITE_MAGIC = b"SQLite format 3\x00"
 SAMPLE_VALUES_PER_COLUMN = 3
+MAX_ENUM_VALUES = 20  # au plus 20 valeurs distinctes pour qu'une colonne soit « catégorielle »
 MAX_KEY_VALUES = 2000
 
 GENERIC_TOKENS = {"id", "ids", "key", "ref", "reference", "code", "uuid", "guid",
@@ -59,8 +65,31 @@ NON_KEY_TYPES = ("BLOB", "REAL", "FLOA", "DOUB", "DATE", "TIME", "BOOL")
 # ---------------------------------------------------------------------------
 
 def _tokens(name: str) -> list[str]:
+    name = unicodedata.normalize("NFKD", name)                       # « employé » -> « employe »
+    name = "".join(c for c in name if not unicodedata.combining(c))
     name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
     return [t for t in re.split(r"[^A-Za-z0-9]+", name.lower()) if t]
+
+
+# Mêmes entités, noms différents (français / anglais) : « client_id » d'un côté et « customer_id »
+# de l'autre désignent la même entité. Liste volontairement prudente : pas de mot ambigu
+# (account, item, article...), car une fausse équivalence créerait une fausse correspondance.
+ENTITY_SYNONYMS = [
+    ("customer", "client", "acheteur", "buyer", "consommateur", "consumer"),
+    ("product", "produit"),
+    ("order", "commande", "achat", "purchase"),
+    ("user", "utilisateur", "membre", "member"),
+    ("review", "avis", "avi", "commentaire"),
+    ("supplier", "fournisseur", "vendor", "vendeur", "seller"),
+    ("employee", "employe", "salarie"),
+    ("invoice", "facture"),
+    ("payment", "paiement", "reglement"),
+    ("delivery", "livraison", "shipment", "expedition"),
+    ("category", "categorie"),
+    ("store", "magasin", "boutique", "shop"),
+    ("producer", "producteur", "farmer", "agriculteur"),
+]
+_CANONICAL = {word: group[0] for group in ENTITY_SYNONYMS for word in group}
 
 
 def _singular(word: str) -> str:
@@ -74,9 +103,13 @@ def _singular(word: str) -> str:
 def _signature(field: str, container: str) -> set[str]:
     """Mots significatifs d'un champ ; si le champ est générique (id, code...),
     on emprunte le nom de la table/collection (customers.id -> {customer})."""
-    sig = {_singular(t) for t in _tokens(field) if t not in GENERIC_TOKENS}
+    def canon(token: str) -> str:
+        word = _singular(token)
+        return _CANONICAL.get(word, word)
+
+    sig = {canon(t) for t in _tokens(field) if t not in GENERIC_TOKENS}
     if not sig:
-        sig = {_singular(t) for t in _tokens(container) if t not in GENERIC_TOKENS}
+        sig = {canon(t) for t in _tokens(container) if t not in GENERIC_TOKENS}
     return sig
 
 
@@ -94,6 +127,31 @@ def _quote(identifier: str) -> str:
 
 def _short(value: Any) -> Any:
     return value[:40] + "…" if isinstance(value, str) and len(value) > 40 else value
+
+
+def _distinct_values(conn: sqlite3.Connection, table: str, column: dict[str, Any]) -> list[Any]:
+    """Toutes les valeurs d'une colonne texte catégorielle (peu de valeurs, qui se répètent),
+    sinon []. Évite les colonnes d'identifiants, de noms propres ou de texte libre."""
+    declared = str(column.get("type") or "").upper()
+    if declared and not any(t in declared for t in ("CHAR", "TEXT", "CLOB")):
+        return []
+    name = column["name"]
+    if column.get("primary_key") or _key_like(name):
+        return []
+    try:
+        rows = conn.execute(
+            f"SELECT {_quote(name)}, COUNT(*) AS n FROM {_quote(table)} "
+            f"WHERE {_quote(name)} IS NOT NULL GROUP BY {_quote(name)} ORDER BY n DESC, 1 LIMIT {MAX_ENUM_VALUES + 1}"
+        ).fetchall()
+    except Exception:
+        return []
+    if not rows or len(rows) > MAX_ENUM_VALUES:
+        return []
+    values = [r[0] for r in rows]
+    total = sum(r[1] for r in rows)
+    if not all(isinstance(v, str) and len(v) <= 40 for v in values) or total < 2 * len(values):
+        return []   # valeurs presque toutes différentes : identifiants / texte libre, pas une catégorie
+    return values
 
 
 def build_sqlite_docs(db_path: Path = SQLITE_DB) -> dict[str, Any]:
@@ -121,6 +179,9 @@ def build_sqlite_docs(db_path: Path = SQLITE_DB) -> dict[str, Any]:
                     values = []
                 if values:
                     column["sample_values"] = values
+                enum = _distinct_values(conn, table["name"], column)
+                if enum:
+                    column["distinct_values"] = enum
     finally:
         conn.close()
     return docs
@@ -178,6 +239,10 @@ def _mongo_key_candidates(payload: dict[str, list[dict[str, Any]]]) -> list[dict
     return candidates
 
 
+def _numeric_only(values: set[str]) -> bool:
+    return bool(values) and all(v.lstrip("-").isdigit() for v in values)
+
+
 def suggest_mappings(sqlite_docs: dict[str, Any], db_path: Path,
                      mongo_payload: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
     """Propose des correspondances (table.colonne ↔ collection.champ) quand les
@@ -192,10 +257,19 @@ def suggest_mappings(sqlite_docs: dict[str, Any], db_path: Path,
             overlap = len(common) / min(len(s["values"]), len(m["values"]))
             shared_words = s["sig"] & m["sig"]
             name_match = bool(shared_words)
-            strong_values = overlap >= 0.9 and len(common) >= 5
+            # Des entiers (1, 2, 3...) se recoupent par simple coïncidence entre deux colonnes d'identifiants
+            # sans rapport (customers.customer_id ↔ tickets.ticket_id) : ce n'est PAS une preuve. Seuls des
+            # codes qui se recoupent (SKU-001, e-mails, UUID...) valent preuve sans nom de champ commun.
+            strong_values = overlap >= 0.9 and len(common) >= 5 and not _numeric_only(common)
+            # Preuve par les seules valeurs, assez forte pour valider SANS intervention de l'utilisateur :
+            # beaucoup de codes distincts (≥ 10), quasi tous communs (≥ 95 %). Le hasard ne produit pas ça.
+            proven_by_values = strong_values and overlap >= 0.95 and len(common) >= 10
             if overlap < 0.5 or not (name_match or strong_values):
                 continue
-            confidence = round(0.6 * overlap + 0.4 * (1.0 if name_match else 0.0), 2)
+            confidence = 0.6 * overlap + 0.4 * (1.0 if name_match else 0.0)
+            if proven_by_values:
+                confidence = max(confidence, 0.85)
+            confidence = round(confidence, 2)
             pair = (s["table"], m["collection"])
             if pair in best and best[pair]["confidence"] >= confidence:
                 continue
@@ -213,6 +287,7 @@ def suggest_mappings(sqlite_docs: dict[str, Any], db_path: Path,
                     "mongodb_distinct": len(m["values"]),
                     "overlap": round(overlap, 2),
                     "names_match": name_match,
+                    "proven_by_values": proven_by_values,
                 },
             }
     return sorted(best.values(), key=lambda x: -x["confidence"])
@@ -298,13 +373,22 @@ def _read_docs(path: Path, key: str) -> dict[str, Any]:
         return {key: []}
 
 
-def _read_mongo_payload() -> dict[str, list[dict[str, Any]]] | None:
-    """Données MongoDB disponibles pour l'analyse : fichier importé, sinon échantillon du serveur."""
+def _read_mongo_source() -> tuple[dict[str, list[dict[str, Any]]] | None, dict[str, int] | None]:
+    """Données MongoDB à analyser : (documents, vrais totaux par collection).
+    Base connectée depuis l'interface : toujours le serveur (le JSON importé auparavant
+    est ignoré, pas supprimé). Sinon : fichier importé, puis serveur MONGO_URI."""
+    conn = mongo_connection()
+    if conn and conn["source"] == "connected":
+        return read_live_mongodb(conn["uri"], conn["database"], limit=MAX_KEY_VALUES)
     if MONGO_DATA.exists():
-        return json.loads(MONGO_DATA.read_text(encoding="utf-8"))
-    if os.getenv("MONGO_URI"):
-        return sample_live_collections(limit=MAX_KEY_VALUES)
-    return None
+        return json.loads(MONGO_DATA.read_text(encoding="utf-8")), None
+    if conn:
+        return read_live_mongodb(conn["uri"], conn["database"], limit=MAX_KEY_VALUES)
+    return None, None
+
+
+def _read_mongo_payload() -> dict[str, list[dict[str, Any]]] | None:
+    return _read_mongo_source()[0]
 
 
 def _summary(sqlite_docs: dict[str, Any] | None, mongo_docs: dict[str, Any] | None,
@@ -361,10 +445,36 @@ def ingest_sqlite_file(uploaded: Path) -> dict[str, Any]:
 
 def ingest_mongo_payload(payload: Any) -> dict[str, Any]:
     """Valide, installe les données MongoDB, puis génère documentation et correspondances."""
+    conn = mongo_connection()
+    if conn and conn["source"] == "connected":
+        raise ValueError(
+            "Une base MongoDB est connectée (lecture seule) : déconnectez-la avant d'importer un fichier JSON."
+        )
     payload = validate_mongo_payload(payload)
     _write_json(MONGO_DATA, payload)
-    if os.getenv("MONGO_URI"):
+    if conn:
         load_payload_into_server(payload)
+    return analyze_workspace()
+
+
+def connect_mongodb(uri: str, database: str) -> dict[str, Any]:
+    """Connecte DataTalk à une base MongoDB existante (lecture seule) : teste la
+    connexion, la mémorise, puis documente la base et propose les correspondances."""
+    info = check_mongo_connection(uri, database)      # ValueError lisible si inutilisable
+    persisted = save_mongo_connection(uri, database)
+    try:
+        summary = analyze_workspace()
+    except Exception:
+        clear_mongo_connection()                      # ne pas garder une connexion non analysable
+        raise
+    return {"summary": summary, "collections": info["collections"], "persisted": persisted}
+
+
+def disconnect_mongodb() -> dict[str, Any]:
+    """Oublie la connexion saisie dans l'interface (la base MongoDB n'est pas touchée)."""
+    clear_mongo_connection()
+    if not MONGO_DATA.exists() and not mongo_connection():
+        MONGO_DOCS.unlink(missing_ok=True)            # plus aucune source MongoDB : doc obsolète
     return analyze_workspace()
 
 
@@ -376,10 +486,10 @@ def analyze_workspace() -> dict[str, Any]:
         sqlite_docs = build_sqlite_docs(SQLITE_DB)
         _write_json(SQLITE_DOCS, sqlite_docs)
 
-    mongo_payload = _read_mongo_payload()
+    mongo_payload, mongo_totals = _read_mongo_source()
     mongo_docs = None
     if mongo_payload is not None:
-        mongo_docs = analyze_mongo_payload(mongo_payload)
+        mongo_docs = analyze_mongo_payload(mongo_payload, totals=mongo_totals)
         _write_json(MONGO_DOCS, mongo_docs)
 
     mappings = refresh_mappings(sqlite_docs, mongo_docs, SQLITE_DB, mongo_payload)

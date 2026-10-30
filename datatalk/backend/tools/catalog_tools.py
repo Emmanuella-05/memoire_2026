@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ SQLITE_DB = DATA_DIR / "sqlite" / "data.db"
 SQLITE_DOCS = DATA_DIR / "sqlite" / "database_docs.json"
 MONGO_DATA = DATA_DIR / "mongodb" / "data.json"
 MONGO_DOCS = DATA_DIR / "mongodb" / "database_docs.json"
+MONGO_CONNECTION = DATA_DIR / "mongodb" / "connection.json"
 MAPPINGS_FILE = DATA_DIR / "mappings.json"
 BUSINESS_RULES_FILE = DATA_DIR / "business_rules.json"
 
@@ -65,13 +67,77 @@ def load_database_docs(database: str) -> dict[str, Any]:
     raise ValueError(f"Unsupported database type: {database}")
 
 
+# ---------------------------------------------------------------------------
+# Connexion à un serveur MongoDB existant
+# ---------------------------------------------------------------------------
+# Trois origines, par ordre de priorité :
+#   "connected" : saisie dans l'interface (POST /connect/mongodb). LECTURE SEULE :
+#                 DataTalk interroge la base telle qu'elle est, sans jamais y écrire.
+#   "env"       : variables MONGO_URI / MONGO_DB du .env (comportement historique :
+#                 un JSON importé y est chargé, les collections de même nom sont remplacées).
+#   (aucune)    : moteur embarqué `mongomock`, alimenté par le JSON importé.
+# Une URI contenant un mot de passe n'est JAMAIS écrite sur le disque : elle reste en
+# mémoire jusqu'à l'arrêt du backend (pour la rendre permanente, utiliser MONGO_URI).
+
+_session_connection: dict[str, str] | None = None
+
+
+def uri_has_credentials(uri: str) -> bool:
+    return bool(re.match(r"^mongodb(?:\+srv)?://[^/@]*@", uri.strip()))
+
+
+def mask_uri(uri: str) -> str:
+    """URI sans identifiant ni mot de passe (affichable)."""
+    return re.sub(r"^(mongodb(?:\+srv)?://)[^/@]*@", r"\1", uri.strip())
+
+
+def mongo_connection() -> dict[str, str] | None:
+    """Connexion MongoDB active : {"uri", "database", "source"} ou None (moteur embarqué)."""
+    if _session_connection:
+        return {**_session_connection, "source": "connected"}
+    saved = load_json(MONGO_CONNECTION, None)
+    if isinstance(saved, dict) and saved.get("uri") and saved.get("database"):
+        return {"uri": str(saved["uri"]), "database": str(saved["database"]), "source": "connected"}
+    uri = os.getenv("MONGO_URI")
+    if uri:
+        return {"uri": uri, "database": os.getenv("MONGO_DB", "datatalk"), "source": "env"}
+    return None
+
+
+def public_mongo_connection() -> dict[str, str] | None:
+    """Description de la connexion sans secret, pour l'interface."""
+    conn = mongo_connection()
+    if not conn:
+        return None
+    return {"source": conn["source"], "server": mask_uri(conn["uri"]), "database": conn["database"]}
+
+
+def save_mongo_connection(uri: str, database: str) -> bool:
+    """Mémorise la connexion saisie. Retourne True si elle est enregistrée sur
+    disque (URI sans mot de passe), False si elle reste en mémoire seulement."""
+    global _session_connection
+    if uri_has_credentials(uri):
+        _session_connection = {"uri": uri, "database": database}
+        MONGO_CONNECTION.unlink(missing_ok=True)
+        return False
+    _session_connection = None
+    _write_json(MONGO_CONNECTION, {"uri": uri, "database": database})
+    return True
+
+
+def clear_mongo_connection() -> None:
+    global _session_connection
+    _session_connection = None
+    MONGO_CONNECTION.unlink(missing_ok=True)
+
+
 def available_sources() -> list[str]:
     """Sources réellement utilisables ("sql", "mongo") : données présentes ET
     documentation générée. L'utilisateur peut importer l'une, l'autre ou les deux."""
     sources = []
     if SQLITE_DB.exists() and load_database_docs("sqlite").get("tables"):
         sources.append("sql")
-    if (MONGO_DATA.exists() or os.getenv("MONGO_URI")) and load_database_docs("mongodb").get("collections"):
+    if (MONGO_DATA.exists() or mongo_connection()) and load_database_docs("mongodb").get("collections"):
         sources.append("mongo")
     return sources
 
@@ -93,13 +159,29 @@ def mapping_is_valid(mapping: dict[str, Any]) -> bool:
     )
 
 
+# Une correspondance détectée automatiquement n'est utilisée par le mode hybride qu'à partir de ce
+# niveau de confiance (0.6 × recoupement des valeurs + 0.4 × nom de champ commun : 0.8 exige un nom
+# commun ET un bon recoupement). En dessous, elle reste visible dans l'interface mais inutilisée
+# tant que l'utilisateur ne l'a pas confirmée.
+MIN_AUTO_CONFIDENCE = float(os.getenv("DATATALK_MAPPING_MIN_CONFIDENCE", "0.8"))
+
+
+def mapping_is_trusted(mapping: dict[str, Any]) -> bool:
+    """Correspondance utilisable par le mode hybride : valide, non rejetée, et soit confirmée /
+    saisie par l'utilisateur, soit détectée avec une confiance suffisante."""
+    if mapping.get("status") == "rejected" or not mapping_is_valid(mapping):
+        return False
+    if mapping.get("status") == "confirmed" or mapping.get("source") == "manual":
+        return True
+    try:
+        return float(mapping.get("confidence") or 0) >= MIN_AUTO_CONFIDENCE
+    except (TypeError, ValueError):
+        return False
+
+
 def load_mappings() -> list[dict[str, Any]]:
-    """Correspondances SQL ↔ MongoDB utilisables par le mode hybride :
-    complètes et non rejetées par l'utilisateur."""
-    return [
-        m for m in load_all_mappings()
-        if m.get("status") != "rejected" and mapping_is_valid(m)
-    ]
+    """Correspondances SQL ↔ MongoDB utilisables par le mode hybride (voir mapping_is_trusted)."""
+    return [m for m in load_all_mappings() if mapping_is_trusted(m)]
 
 
 def mapping_context() -> str:
@@ -251,6 +333,13 @@ __all__ = [
     "SQLITE_DOCS",
     "MONGO_DATA",
     "MONGO_DOCS",
+    "MONGO_CONNECTION",
+    "mongo_connection",
+    "public_mongo_connection",
+    "save_mongo_connection",
+    "clear_mongo_connection",
+    "uri_has_credentials",
+    "mask_uri",
     "MAPPINGS_FILE",
     "BUSINESS_RULES_FILE",
     "_write_json",
@@ -259,6 +348,8 @@ __all__ = [
     "available_sources",
     "load_all_mappings",
     "load_mappings",
+    "mapping_is_trusted",
+    "MIN_AUTO_CONFIDENCE",
     "mapping_is_valid",
     "mapping_context",
     "get_path",

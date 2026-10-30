@@ -1,10 +1,11 @@
 """Outils MongoDB : inférence de schéma, garde-fous et exécution de pipelines
 d'agrégation.
 
-Deux moteurs, choisis automatiquement :
-  - MONGO_URI défini  -> serveur MongoDB réel (les données importées y sont chargées)
-  - sinon             -> moteur embarqué `mongomock`, alimenté par data.json
-                         (permet d'utiliser DataTalk sans installer MongoDB)
+Deux moteurs, choisis automatiquement (voir catalog_tools.mongo_connection) :
+  - connexion saisie dans l'interface -> serveur MongoDB réel, en LECTURE SEULE
+  - MONGO_URI défini                  -> serveur MongoDB réel (les données importées y sont chargées)
+  - sinon                             -> moteur embarqué `mongomock`, alimenté par data.json
+                                         (permet d'utiliser DataTalk sans installer MongoDB)
 
 Garde-fous : parcours RÉCURSIF du pipeline (opérateurs d'écriture, de code
 JavaScript et d'administration interdits à toute profondeur), noms de
@@ -18,9 +19,10 @@ import itertools
 import json
 import os
 import re
+from datetime import datetime, timezone
 from typing import Any
 
-from .catalog_tools import MONGO_DATA, DataSourceUnavailable
+from .catalog_tools import MONGO_DATA, DataSourceUnavailable, mongo_connection
 
 try:
     from pymongo import MongoClient
@@ -29,11 +31,21 @@ except ImportError:  # pragma: no cover
     MongoClient = None
     PyMongoError = Exception
 
+try:
+    from bson import Decimal128, ObjectId
+except ImportError:  # pragma: no cover
+    Decimal128 = ObjectId = None
+
 MAX_FETCH_ROWS = 10_000
 MAX_TIME_MS = 15_000
 MAX_STAGES = 30
 MAX_PIPELINE_CHARS = 20_000
 SAMPLE_VALUES_PER_FIELD = 3
+MAX_ENUM_VALUES = 20  # au plus 20 valeurs distinctes pour qu'un champ soit « catégoriel »
+# champs de référence / identifiants / données personnelles : jamais énumérés (aligné sur ingest_tools.KEY_LIKE_TOKENS)
+_ENUM_SKIP_TOKENS = {"id", "ids", "key", "ref", "reference", "code", "uuid", "guid", "number", "num", "no", "pk", "fk",
+                     "idx", "sku", "isbn", "slug", "username", "login", "matricule", "email", "mail", "phone", "tel",
+                     "telephone", "password", "token"}
 
 _COLLECTION_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]{0,119}$")
 
@@ -57,6 +69,12 @@ def _json_type(value: Any) -> str:
         return "array"
     if isinstance(value, dict):
         return "object"
+    if isinstance(value, datetime):
+        return "date"
+    if ObjectId is not None and isinstance(value, ObjectId):
+        return "objectId"
+    if Decimal128 is not None and isinstance(value, Decimal128):
+        return "decimal"
     return type(value).__name__
 
 
@@ -104,12 +122,34 @@ def iter_scalar_values(value: Any, prefix: str = ""):
 
 
 def _short(value: Any) -> Any:
+    """Valeur d'exemple affichable ET sérialisable en JSON (dates, ObjectId et
+    Decimal128 d'une vraie base MongoDB deviennent du texte)."""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, (bytes, bytearray)):
+        return f"<binaire {len(value)} octets>"
+    if not isinstance(value, (str, int, float, bool, type(None))):
+        value = str(value)
     return value[:40] + "…" if isinstance(value, str) and len(value) > 40 else value
+
+
+def _enum_values(field: str, seen: dict[str, int] | None) -> list[str]:
+    """Valeurs d'un champ texte catégoriel (peu de valeurs qui se répètent), sinon []."""
+    if not seen:
+        return []
+    last = re.split(r"[.]", field)[-1].lower()
+    if last.endswith("_id") or last in _ENUM_SKIP_TOKENS or set(re.split(r"[^a-z0-9]+", last)) & _ENUM_SKIP_TOKENS:
+        return []
+    if any(len(v) > 40 for v in seen) or sum(seen.values()) < 2 * len(seen):
+        return []
+    return [v for v, _ in sorted(seen.items(), key=lambda item: (-item[1], item[0]))]
 
 
 def _docs_to_collection_entry(name: str, docs: list[dict[str, Any]], total: int, sample_size: int) -> dict[str, Any]:
     field_types: dict[str, set[str]] = {}
     samples: dict[str, list[Any]] = {}
+    counts: dict[str, dict[str, int]] = {}      # champ texte -> {valeur: occurrences} (abandonné au-delà de 20 valeurs)
+    overflow: set[str] = set()
     for doc in docs:
         for field, types in _flatten_mongo_fields(doc).items():
             field_types.setdefault(field, set()).update(types)
@@ -117,11 +157,20 @@ def _docs_to_collection_entry(name: str, docs: list[dict[str, Any]], total: int,
             bucket = samples.setdefault(path, [])
             if scalar is not None and len(bucket) < SAMPLE_VALUES_PER_FIELD and scalar not in bucket:
                 bucket.append(_short(scalar))
+            if isinstance(scalar, str) and path not in overflow:
+                seen = counts.setdefault(path, {})
+                seen[scalar] = seen.get(scalar, 0) + 1
+                if len(seen) > MAX_ENUM_VALUES:
+                    overflow.add(path)
+                    counts.pop(path, None)
     fields = []
     for field, types in sorted(field_types.items()):
         entry = {"name": field, "type": _merge_type(types), "sampled": len(docs)}
         if samples.get(field):
             entry["sample_values"] = samples[field]
+        enum = _enum_values(field, counts.get(field))
+        if enum:
+            entry["distinct_values"] = enum
         fields.append(entry)
     return {
         "name": name,
@@ -133,16 +182,20 @@ def _docs_to_collection_entry(name: str, docs: list[dict[str, Any]], total: int,
 
 
 def analyze_mongo_payload(payload: dict[str, list[dict[str, Any]]], sample_size: int = 200,
-                          database_name: str | None = None) -> dict[str, Any]:
+                          database_name: str | None = None,
+                          totals: dict[str, int] | None = None) -> dict[str, Any]:
     """Documentation des collections à partir des documents eux-mêmes (aucun
-    serveur MongoDB requis)."""
+    serveur MongoDB requis). `totals` donne le vrai nombre de documents de chaque
+    collection quand `payload` n'en contient qu'un échantillon (base connectée)."""
+    totals = totals or {}
     collections = [
-        _docs_to_collection_entry(name, docs[:sample_size], len(docs), sample_size)
+        _docs_to_collection_entry(name, docs[:sample_size], totals.get(name, len(docs)), sample_size)
         for name, docs in sorted(payload.items())
     ]
+    conn = mongo_connection()
     return {
         "database": "mongodb",
-        "database_name": database_name or os.getenv("MONGO_DB", "datatalk"),
+        "database_name": database_name or (conn or {}).get("database") or os.getenv("MONGO_DB", "datatalk"),
         "collections": collections,
     }
 
@@ -150,30 +203,104 @@ def analyze_mongo_payload(payload: dict[str, list[dict[str, Any]]], sample_size:
 def analyze_mongodb_schema(mongo_uri: str | None = None, database: str | None = None,
                            sample_size: int = 200) -> dict[str, Any]:
     """Documente un serveur MongoDB existant (échantillon de chaque collection)."""
-    payload = sample_live_collections(mongo_uri, database, sample_size)
-    return analyze_mongo_payload(payload, sample_size, database)
+    payload, totals = read_live_mongodb(mongo_uri, database, sample_size)
+    return analyze_mongo_payload(payload, sample_size, database, totals)
 
 
-def sample_live_collections(mongo_uri: str | None = None, database: str | None = None,
-                            limit: int = 1000) -> dict[str, list[dict[str, Any]]]:
+_DB_NAME_RE = re.compile(r'^[^/\\. "$*<>:|?\x00]{1,63}$')
+
+
+def _friendly_mongo_error(exc: Exception) -> str:
+    """Message lisible pour l'utilisateur, sans jamais citer l'URI (mot de passe)."""
+    name = type(exc).__name__
+    text = str(exc).lower()
+    if name in ("ServerSelectionTimeoutError", "AutoReconnect", "NetworkTimeout", "ConnectionFailure"):
+        return ("MongoDB est injoignable à cette adresse. Vérifiez que le serveur MongoDB est démarré "
+                "(sous Windows : service « MongoDB ») et que l'adresse et le port sont corrects.")
+    if name == "OperationFailure" and ("auth" in text or "unauthorized" in text or "not authorized" in text):
+        return "Accès refusé par MongoDB : vérifiez l'identifiant, le mot de passe et les droits de lecture."
+    if name in ("InvalidURI", "ConfigurationError"):
+        return "URI MongoDB invalide. Exemple : mongodb://localhost:27017"
+    return f"Erreur MongoDB ({name})."
+
+
+def _open_client(uri: str, timeout_ms: int = 4000):
     if MongoClient is None:
         raise DataSourceUnavailable("Le paquet 'pymongo' n'est pas installé.")
-    uri = mongo_uri or os.getenv("MONGO_URI")
+    try:
+        return MongoClient(uri, serverSelectionTimeoutMS=timeout_ms)
+    except Exception as exc:  # URI mal formée
+        raise ValueError(_friendly_mongo_error(exc)) from exc
+
+
+def check_mongo_connection(uri: str, database: str) -> dict[str, Any]:
+    """Teste la connexion et liste les collections (avec leur nombre de documents).
+    Lève ValueError avec un message lisible si la base n'est pas utilisable."""
+    if not re.match(r"^mongodb(?:\+srv)?://\S+$", uri.strip()):
+        raise ValueError("L'URI doit commencer par mongodb:// (ou mongodb+srv://). Exemple : mongodb://localhost:27017")
+    if not _DB_NAME_RE.match(database):
+        raise ValueError("Nom de base invalide (63 caractères maximum, sans espace ni / \\ . \" $).")
+    client = _open_client(uri.strip())
+    try:
+        client.admin.command("ping")
+        db = client[database]
+        names = sorted(n for n in db.list_collection_names() if not n.startswith("system."))
+        if not names:
+            others: list[str] = []
+            try:
+                others = [d for d in client.list_database_names() if d not in ("admin", "config", "local")]
+            except PyMongoError:
+                pass
+            hint = f" Bases disponibles : {', '.join(others)}." if others else ""
+            raise ValueError(f"La base '{database}' n'existe pas ou ne contient aucune collection.{hint}")
+        collections = []
+        for name in names:
+            try:
+                count: int | None = db[name].estimated_document_count()
+            except PyMongoError:
+                count = None  # vue ou compte non disponible
+            collections.append({"name": name, "documents": count})
+        return {"collections": collections}
+    except ValueError:
+        raise
+    except PyMongoError as exc:
+        raise ValueError(_friendly_mongo_error(exc)) from exc
+    finally:
+        client.close()
+
+
+def read_live_mongodb(mongo_uri: str | None = None, database: str | None = None,
+                      limit: int = 1000) -> tuple[dict[str, list[dict[str, Any]]], dict[str, int]]:
+    """Lecture seule d'un serveur MongoDB : (échantillon de documents par collection,
+    vrai nombre de documents par collection). Le champ _id est omis de l'échantillon."""
+    conn = mongo_connection()
+    uri = mongo_uri or (conn or {}).get("uri")
     if not uri:
-        raise DataSourceUnavailable("MONGO_URI n'est pas défini.")
-    db_name = database or os.getenv("MONGO_DB", "datatalk")
-    client = MongoClient(uri, serverSelectionTimeoutMS=3000)
+        raise DataSourceUnavailable("Aucune connexion MongoDB n'est configurée.")
+    db_name = database or (conn or {}).get("database") or os.getenv("MONGO_DB", "datatalk")
+    client = _open_client(uri, 3000)
+    payload: dict[str, list[dict[str, Any]]] = {}
+    totals: dict[str, int] = {}
     try:
         db = client[db_name]
-        return {
-            name: list(db[name].find({}, {"_id": 0}).limit(limit))
-            for name in sorted(db.list_collection_names())
-            if not name.startswith("system.")
-        }
+        for name in sorted(db.list_collection_names()):
+            if name.startswith("system."):
+                continue
+            payload[name] = list(db[name].find({}, {"_id": 0}).limit(limit))
+            try:
+                totals[name] = db[name].estimated_document_count()
+            except PyMongoError:
+                totals[name] = len(payload[name])
+        return payload, totals
     except PyMongoError as exc:
         raise DataSourceUnavailable(f"MongoDB injoignable ({type(exc).__name__}).") from exc
     finally:
         client.close()
+
+
+def sample_live_collections(mongo_uri: str | None = None, database: str | None = None,
+                            limit: int = 1000) -> dict[str, list[dict[str, Any]]]:
+    return read_live_mongodb(mongo_uri, database, limit)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -299,11 +426,36 @@ _mock_cache: dict[str, Any] = {"stamp": None, "client": None}
 
 
 def _use_real_server() -> bool:
-    return bool(os.getenv("MONGO_URI"))
+    return mongo_connection() is not None
 
 
 def _db_name() -> str:
-    return os.getenv("MONGO_DB", "datatalk")
+    conn = mongo_connection()
+    return conn["database"] if conn else os.getenv("MONGO_DB", "datatalk")
+
+
+def _to_bson(value: Any) -> Any:
+    """Convertit le JSON étendu écrit par le LLM en vrais types BSON, pour comparer
+    des champs de type date ou objectId d'un vrai serveur :
+    {"$date": "2024-01-31"} -> datetime ; {"$oid": "..."} -> ObjectId."""
+    if isinstance(value, dict):
+        if set(value) == {"$date"} and isinstance(value["$date"], str):
+            text = value["$date"].strip().replace("Z", "+00:00")
+            try:
+                parsed = datetime.fromisoformat(text)
+            except ValueError as exc:
+                raise ValueError(f"Date invalide : {value['$date']!r} (format AAAA-MM-JJ ou AAAA-MM-JJTHH:MM:SSZ).") from exc
+            # datetime naïf en UTC : c'est ce que PyMongo écrit et relit pour les dates BSON
+            return parsed.astimezone(timezone.utc).replace(tzinfo=None) if parsed.tzinfo else parsed
+        if set(value) == {"$oid"} and isinstance(value["$oid"], str) and ObjectId is not None:
+            try:
+                return ObjectId(value["$oid"])
+            except Exception as exc:
+                raise ValueError(f"ObjectId invalide : {value['$oid']!r}.") from exc
+        return {key: _to_bson(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_to_bson(child) for child in value]
+    return value
 
 
 def _mock_client():
@@ -331,12 +483,18 @@ def _mock_client():
 
 def load_payload_into_server(payload: dict[str, list[dict[str, Any]]]) -> None:
     """Charge les collections importées dans le serveur MongoDB (MONGO_URI).
-    Les collections portant le même nom sont remplacées."""
+    Les collections portant le même nom sont remplacées. Refusé pour une base
+    connectée depuis l'interface : elle est en lecture seule."""
+    conn = mongo_connection()
+    if not conn:
+        raise DataSourceUnavailable("Aucun serveur MongoDB n'est configuré.")
+    if conn["source"] == "connected":
+        raise ValueError("La base MongoDB connectée est en lecture seule : aucune donnée n'y est écrite.")
     if MongoClient is None:
         raise DataSourceUnavailable("Le paquet 'pymongo' n'est pas installé.")
-    client = MongoClient(os.environ["MONGO_URI"], serverSelectionTimeoutMS=3000)
+    client = MongoClient(conn["uri"], serverSelectionTimeoutMS=3000)
     try:
-        db = client[_db_name()]
+        db = client[conn["database"]]
         for name, docs in payload.items():
             db.drop_collection(name)
             if docs:
@@ -356,10 +514,12 @@ def execute_mongo(collection: str, pipeline: list[dict[str, Any]],
     if reason:
         raise ValueError(reason)
 
-    if _use_real_server():
+    conn = mongo_connection()
+    if conn:
         if MongoClient is None:
             raise DataSourceUnavailable("Le paquet 'pymongo' n'est pas installé.")
-        client = MongoClient(os.environ["MONGO_URI"], serverSelectionTimeoutMS=3000)
+        client = MongoClient(conn["uri"], serverSelectionTimeoutMS=3000)
+        pipeline = _to_bson(pipeline)
         kwargs: dict[str, Any] = {"maxTimeMS": MAX_TIME_MS, "allowDiskUse": False}
         close = client.close
     else:

@@ -33,3 +33,7 @@ node_modules/
 
 # Index RAG généré (reconstruit automatiquement)
 backend/rag/vectorstore/
+# Données générées et locales (analyse de la vraie base, import, connexion)
+data/mongodb/data.json
+data/mongodb/connection.json
+data/business_rules.json

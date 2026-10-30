@@ -42,11 +42,16 @@ from .tools.catalog_tools import (
     DataSourceUnavailable,
     available_sources,
     load_all_mappings,
+    mapping_is_trusted,
+    mongo_connection,
     load_database_docs,
+    public_mongo_connection,
     save_business_rules,
 )
 from .tools.ingest_tools import (
     analyze_workspace,
+    connect_mongodb,
+    disconnect_mongodb,
     ingest_mongo_payload,
     ingest_sqlite_file,
     save_user_mappings,
@@ -103,6 +108,11 @@ class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1)
 
 
+class MongoConnectRequest(BaseModel):
+    uri: str = Field(..., min_length=10, max_length=2000)
+    database: str = Field(..., min_length=1, max_length=63)
+
+
 class QueryResponse(BaseModel):
     question: str
     source: str | None = None
@@ -131,7 +141,8 @@ def _workspace() -> dict[str, Any]:
         "sqlite_docs": SQLITE_DOCS.exists(),
         "mongodb_data": MONGO_DATA.exists(),
         "mongodb_docs": MONGO_DOCS.exists(),
-        "mongodb_engine": "server" if os.getenv("MONGO_URI") else "embedded",
+        "mongodb_engine": "server" if mongo_connection() else "embedded",
+        "mongodb_connection": public_mongo_connection(),
         "available_sources": available_sources(),
         "mappings": MAPPINGS_FILE.exists(),
         "business_rules": BUSINESS_RULES_FILE.exists(),
@@ -181,9 +192,14 @@ def schemas() -> dict[str, Any]:
     return {"sqlite": load_database_docs("sqlite"), "mongodb": load_database_docs("mongodb")}
 
 
+def _with_usage(mappings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ajoute « usable » : la correspondance est-elle utilisée par le mode hybride ?"""
+    return [{**m, "usable": mapping_is_trusted(m)} for m in mappings]
+
+
 @app.get("/mappings")
 def get_mappings() -> dict[str, Any]:
-    return {"mappings": load_all_mappings()}
+    return {"mappings": _with_usage(load_all_mappings())}
 
 
 @app.put("/mappings")
@@ -194,7 +210,7 @@ def put_mappings(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
             mappings = save_user_mappings(body.get("mappings"))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return {"mappings": mappings, "workspace": _workspace()}
+    return {"mappings": _with_usage(mappings), "workspace": _workspace()}
 
 
 @app.post("/query", response_model=QueryResponse)
@@ -225,6 +241,7 @@ def query(request: QueryRequest) -> QueryResponse:
         "join_plan": state.get("join_plan"),
         "join_error": state.get("join_error"),
         "join_stats": state.get("join_stats"),
+        "hybrid_key_count": state.get("hybrid_key_count"),
         "attempts": {
             "sql": state.get("sql_attempts"),
             "mongo": state.get("mongo_attempts"),
@@ -282,6 +299,35 @@ async def upload_mongodb_data(file: UploadFile = File(...)) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"message": "Données MongoDB importées et analysées.", "summary": summary, "workspace": _workspace()}
+
+
+@app.post("/connect/mongodb")
+async def connect_mongodb_endpoint(body: MongoConnectRequest) -> dict[str, Any]:
+    """Connecte DataTalk à une base MongoDB existante (lecture seule), sans passer par
+    un fichier : teste la connexion, documente les collections, propose les correspondances."""
+    def _connect() -> dict[str, Any]:
+        with _ingest_lock:
+            return connect_mongodb(body.uri.strip(), body.database.strip())
+
+    try:
+        result = await run_in_threadpool(_connect)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    message = "Base MongoDB connectée (lecture seule) et analysée."
+    if not result["persisted"]:
+        message += " L'URI contient un mot de passe : elle n'est pas enregistrée sur le disque et sera à ressaisir après un redémarrage du backend."
+    return {"message": message, **result, "workspace": _workspace()}
+
+
+@app.delete("/connect/mongodb")
+async def disconnect_mongodb_endpoint() -> dict[str, Any]:
+    """Oublie la connexion MongoDB saisie dans l'interface ; la base elle-même n'est pas modifiée."""
+    def _disconnect() -> dict[str, Any]:
+        with _ingest_lock:
+            return disconnect_mongodb()
+
+    summary = await run_in_threadpool(_disconnect)
+    return {"message": "Base MongoDB déconnectée.", "summary": summary, "workspace": _workspace()}
 
 
 @app.post("/upload/business-rules")

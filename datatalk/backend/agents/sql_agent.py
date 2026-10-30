@@ -22,7 +22,9 @@ from __future__ import annotations
 from typing import Any
 
 from ..llm import LLMError, claude_json
-from ..tools.catalog_tools import DataSourceUnavailable, load_database_docs
+from ..tools.catalog_tools import DataSourceUnavailable
+from ..tools.hybrid_tools import coerce_for_sql, display_sql, with_selected_ids
+from ..tools.schema_tools import sql_schema_summary
 from ..tools.rag_tools import context as rag_context
 from ..tools.sql_tools import execute_sql, sql_compile_error, sql_rejection_reason
 
@@ -67,20 +69,32 @@ Corrige la requête. Réponds STRICTEMENT avec le même format JSON :
 
 
 def _schema_summary() -> str:
-    docs = load_database_docs("sqlite")
-    lines = []
-    for table in docs.get("tables", []):
-        columns = ", ".join(
-            f"{c.get('name', '')}:{c.get('type', 'unknown')}"
-            for c in table.get("columns", [])
-        )
-        lines.append(f"- {table.get('name', '')}({columns})")
-    return "\n".join(lines) if lines else "Aucune table documentée."
+    """Tables, colonnes typées et valeurs exactes des colonnes catégorielles."""
+    return sql_schema_summary()
 
 
-def _join_requirement(join_plan: dict[str, Any] | None) -> str:
+SELECTED_IDS_NOTE = (
+    "(Note : la table temporaire selected_ids(id) contient déjà les identifiants sélectionnés "
+    "par l'étape précédente.)"
+)
+
+
+def _join_requirement(join_plan: dict[str, Any] | None, step: str | None = None) -> str:
     if not join_plan:
         return ""
+    if step == "first":
+        return (
+            "\n\nÉtape 1 d'une question hybride : retourne UNIQUEMENT les identifiants DISTINCTS "
+            f"de la colonne '{join_plan.get('sqlite_key')}' (table {join_plan.get('sqlite_table')}) "
+            "des lignes qui répondent à la question, sans agrégation."
+        )
+    if step == "second":
+        return (
+            "\n\nÉtape 2 d'une question hybride : les identifiants déjà sélectionnés par l'étape précédente "
+            "sont dans la table temporaire selected_ids(id). Restreins-toi à eux, par exemple "
+            f"WHERE {join_plan.get('sqlite_table')}.{join_plan.get('sqlite_key')} IN (SELECT id FROM selected_ids). "
+            "N'écris aucun identifiant toi-même et ne crée pas selected_ids."
+        )
     return (
         "\n\nContrainte HYBRID : cette requête sera jointe à MongoDB. "
         f"Elle doit impérativement retourner, sans l'agréger, la colonne de jointure "
@@ -88,19 +102,20 @@ def _join_requirement(join_plan: dict[str, Any] | None) -> str:
     )
 
 
-def generate_sql(question: str, join_plan: dict[str, Any] | None = None) -> str:
+def generate_sql(question: str, join_plan: dict[str, Any] | None = None, step: str | None = None) -> str:
     prompt = (
         f"Schéma SQLite:\n{_schema_summary()}\n\n"
         f"Contexte documentaire:\n{rag_context(question, database='sqlite')}\n\n"
-        f"Question: {question}{_join_requirement(join_plan)}"
+        f"Question: {question}{_join_requirement(join_plan, step)}"
     )
     return _read_sql(claude_json(prompt, system=GENERATE_SYSTEM_PROMPT, max_tokens=500))
 
 
-def fix_sql(question: str, sql: str, issue: str, join_plan: dict[str, Any] | None = None) -> str:
+def fix_sql(question: str, sql: str, issue: str, join_plan: dict[str, Any] | None = None,
+            step: str | None = None) -> str:
     prompt = FIX_PROMPT_TEMPLATE.format(
         schema=_schema_summary(), question=question, sql=sql, issue=issue,
-        join_requirement=_join_requirement(join_plan),
+        join_requirement=_join_requirement(join_plan, step),
     )
     return _read_sql(claude_json(prompt, system=GENERATE_SYSTEM_PROMPT, max_tokens=500))
 
@@ -112,17 +127,20 @@ def _read_sql(parsed: dict[str, Any]) -> str:
     return sql.strip()
 
 
-def validate_sql(question: str, sql: str) -> dict[str, Any]:
+def validate_sql(question: str, sql: str, executable: str | None = None) -> dict[str, Any]:
     """Validation en trois temps : textuelle (lecture seule), compilation par
-    SQLite, puis sémantique (LLM)."""
-    reason = sql_rejection_reason(sql)
+    SQLite, puis sémantique (LLM). `executable` est la requête réellement exécutée
+    (avec la CTE selected_ids) quand elle diffère de celle écrite par le modèle."""
+    checked = executable or sql
+    reason = sql_rejection_reason(checked)
     if reason:
         return {"valid": False, "issues": reason}
-    compile_error = sql_compile_error(sql)
+    compile_error = sql_compile_error(checked)
     if compile_error:
         return {"valid": False, "issues": compile_error}
 
-    prompt = f"Schéma SQLite:\n{_schema_summary()}\n\nQuestion: {question}\n\nRequête: {sql}"
+    note = f"\n{SELECTED_IDS_NOTE}" if executable else ""
+    prompt = f"Schéma SQLite:\n{_schema_summary()}\n\nQuestion: {question}{note}\n\nRequête: {sql}"
     try:
         parsed = claude_json(prompt, system=VALIDATE_SYSTEM_PROMPT, max_tokens=300)
     except ValueError:
@@ -134,27 +152,38 @@ def validate_sql(question: str, sql: str) -> dict[str, Any]:
     return {"valid": False, "issues": parsed.get("issues") or "Requête jugée invalide par le validateur."}
 
 
-def run(question: str, join_plan: dict[str, Any] | None = None) -> dict[str, Any]:
+def run(question: str, join_plan: dict[str, Any] | None = None, injected_keys: list[Any] | None = None,
+        step: str | None = None) -> dict[str, Any]:
     """Génère -> valide -> exécute, avec correction à chaque rejet ou erreur,
-    jusqu'à MAX_ATTEMPTS."""
+    jusqu'à MAX_ATTEMPTS.
+
+    Plan hybride en deux étapes : `question` est alors la SOUS-QUESTION de cette source.
+    step="first"  : la requête doit retourner les identifiants distincts de la clé de jointure ;
+    step="second" : `injected_keys` (identifiants de l'étape 1) est injecté par le code devant
+                    la requête du modèle, sous la forme de la CTE selected_ids(id)."""
     sql: str | None = None       # dernière requête produite (base d'une correction)
     issue: str | None = None
+    keys: list[Any] = []
+    if step == "second":
+        keys = coerce_for_sql(injected_keys or [], join_plan["sqlite_table"], join_plan["sqlite_key"])
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            sql = generate_sql(question, join_plan) if sql is None else fix_sql(question, sql, issue or "", join_plan)
+            sql = (generate_sql(question, join_plan, step) if sql is None
+                   else fix_sql(question, sql, issue or "", join_plan, step))
         except _INFRA_ERRORS:
             raise
         except Exception as exc:
             issue = f"Génération impossible : {exc}"
             continue
 
-        validation = validate_sql(question, sql)
+        executable = with_selected_ids(sql, keys) if step == "second" else None
+        validation = validate_sql(question, sql, executable)
         if not validation["valid"]:
             issue = validation["issues"]
             continue
 
         try:
-            rows = execute_sql(sql)
+            rows = execute_sql(executable or sql)
         except _INFRA_ERRORS:
             raise
         except Exception as exc:
@@ -162,13 +191,15 @@ def run(question: str, join_plan: dict[str, Any] | None = None) -> dict[str, Any
             continue
 
         key = join_plan.get("sqlite_key") if join_plan else None
-        if key and rows and not any(key in row for row in rows):
+        if key and step != "second" and rows and not any(key in row for row in rows):
             issue = f"La requête SQL ne retourne pas la clé de jointure '{key}'."
             continue
 
-        return {"sql_query": sql, "sql_results": rows, "sql_error": None, "sql_attempts": attempt}
+        shown = display_sql(sql, keys) if step == "second" else sql
+        return {"sql_query": shown, "sql_results": rows, "sql_error": None, "sql_attempts": attempt}
 
-    return {"sql_query": sql, "sql_results": [], "sql_error": issue, "sql_attempts": MAX_ATTEMPTS}
+    shown = display_sql(sql, keys) if (step == "second" and sql) else sql
+    return {"sql_query": shown, "sql_results": [], "sql_error": issue, "sql_attempts": MAX_ATTEMPTS}
 
 
 def sql_agent_node(state: dict[str, Any]) -> dict[str, Any]:

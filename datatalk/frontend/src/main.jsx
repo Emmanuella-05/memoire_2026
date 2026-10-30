@@ -59,6 +59,72 @@ function UploadBox({ target, label, accept, onUploaded }) {
   );
 }
 
+function MongoConnect({ connection, onChanged }) {
+  // Connexion directe à une base MongoDB existante (sans fichier). Lecture seule.
+  const [uri, setUri] = useState("mongodb://localhost:27017");
+  const [database, setDatabase] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+
+  async function connect(event) {
+    event.preventDefault();
+    setBusy(true);
+    setMessage("");
+    try {
+      const data = await api("/connect/mongodb", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ uri: uri.trim(), database: database.trim() }),
+      });
+      const names = (data.collections || []).map((c) => `${c.name} (${c.documents ?? "?"})`).join(", ");
+      setMessage(`✓ ${data.message} Collections : ${names}`);
+      onChanged?.();
+    } catch (err) {
+      setMessage(`Erreur : ${err.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function disconnect() {
+    setBusy(true);
+    setMessage("");
+    try {
+      await api("/connect/mongodb", { method: "DELETE" });
+      onChanged?.();
+    } catch (err) {
+      setMessage(`Erreur : ${err.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (connection?.source === "connected") {
+    return (
+      <div className="upload-box mongo-connect">
+        <span>MongoDB connecté (lecture seule)</span>
+        <small>{connection.server} · base <b>{connection.database}</b></small>
+        <button type="button" onClick={disconnect} disabled={busy}>Déconnecter</button>
+        {message && <small>{message}</small>}
+      </div>
+    );
+  }
+
+  return (
+    <form className="upload-box mongo-connect" onSubmit={connect}>
+      <span>Se connecter à MongoDB</span>
+      <input type="text" value={uri} onChange={(e) => setUri(e.target.value)} placeholder="mongodb://localhost:27017"
+        aria-label="URI MongoDB" disabled={busy} />
+      <input type="text" value={database} onChange={(e) => setDatabase(e.target.value)} placeholder="Nom de la base"
+        aria-label="Nom de la base MongoDB" disabled={busy} />
+      <button type="submit" disabled={busy || !uri.trim() || !database.trim()}>
+        {busy ? "Connexion et analyse…" : "Connecter"}
+      </button>
+      {message && <small>{message}</small>}
+    </form>
+  );
+}
+
 function DataTable({ rows }) {
   if (!rows?.length) return null;
   const shown = rows.slice(0, 50);
@@ -115,6 +181,7 @@ function Catalog({ schemas, mappings, onSetStatus }) {
                     <b>{m.entity}</b> : {m.sqlite.table}.{m.sqlite.key} ↔ {m.mongodb.collection}.{m.mongodb.key}
                     {m.confidence != null && <small> · confiance {m.confidence}</small>}
                     <small> · {m.status === "suggested" ? "suggérée" : m.status === "confirmed" ? "confirmée" : "rejetée"}</small>
+                    {m.status === "suggested" && m.usable === false && <small> · non utilisée tant qu'elle n'est pas confirmée</small>}
                   </span>
                   <span className="actions">
                     {m.status !== "confirmed" && <button type="button" onClick={() => onSetStatus(i, "confirmed")}>Confirmer</button>}
@@ -148,6 +215,24 @@ function Trace({ execution, source }) {
         {join_plan && (
           <li>
             <b>Jointure :</b> {join_plan.sqlite_table}.{join_plan.sqlite_key} ↔ {join_plan.mongo_collection}.{join_plan.mongo_key} ({join_plan.how})
+          </li>
+        )}
+        {join_plan?.decomposed && (
+          <li>
+            <b>Plan en deux étapes :</b>
+            <ol>
+              {[join_plan.first, join_plan.first === "sql" ? "mongo" : "sql"].map((src, i) => (
+                <li key={src}>
+                  Étape {i + 1} ({src === "sql" ? "SQL" : "MongoDB"}) : {join_plan[src === "sql" ? "sql_question" : "mongo_question"]}
+                  {i === 0 && execution.hybrid_key_count != null ? ` → ${execution.hybrid_key_count} identifiant(s) transmis à l'étape 2` : ""}
+                </li>
+              ))}
+            </ol>
+          </li>
+        )}
+        {join_plan && join_plan.decomposed === false && (
+          <li>
+            <b>Décomposition :</b> non établie ({join_plan.plan_note || "raison inconnue"}) — la question entière est envoyée aux deux bases.
           </li>
         )}
         {join_error && <li><b>Relation :</b> {join_error}</li>}
@@ -254,7 +339,7 @@ function App() {
   }
 
   const status = workspace
-    ? `MongoDB : ${workspace.mongodb_engine === "server" ? "serveur" : "moteur embarqué"} · RAG : ${workspace.rag_documents ?? "?"} documents indexés${workspace.claude_configured ? "" : " · clé Claude absente"}`
+    ? `MongoDB : ${workspace.mongodb_connection ? `serveur ${workspace.mongodb_connection.database}` : "moteur embarqué"} · RAG : ${workspace.rag_documents ?? "?"} documents indexés${workspace.claude_configured ? "" : " · clé Claude absente"}`
     : "Connexion au workspace…";
 
   return (
@@ -276,8 +361,12 @@ function App() {
           <div className="upload-grid">
             <UploadBox target="sqlite-db" label="Base SQLite" accept=".db,.sqlite,.sqlite3"
               onUploaded={() => { setError(""); refreshCatalog(); }} />
-            <UploadBox target="mongodb-data" label="Données MongoDB (JSON)" accept=".json"
-              onUploaded={() => { setError(""); refreshCatalog(); }} />
+            <MongoConnect connection={workspace?.mongodb_connection}
+              onChanged={() => { setError(""); refreshCatalog(); }} />
+            {workspace?.mongodb_connection?.source !== "connected" && (
+              <UploadBox target="mongodb-data" label="Ou données MongoDB (JSON)" accept=".json"
+                onUploaded={() => { setError(""); refreshCatalog(); }} />
+            )}
             <UploadBox target="business-rules" label="Règles métier (optionnel)" accept=".json,.txt,.md"
               onUploaded={() => { setError(""); refreshCatalog(); }} />
           </div>

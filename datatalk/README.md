@@ -48,6 +48,24 @@ L'interface accepte :
 
 La documentation et les mappings sont rechargés / indexés après upload.
 
+## Se connecter à une base MongoDB existante
+
+Au lieu d'importer un fichier JSON, l'interface permet de saisir l'URI du serveur
+(ex. `mongodb://localhost:27017`) et le nom de la base. DataTalk teste la connexion,
+documente les collections (vrais nombres de documents, types dont `date` et `objectId`),
+propose les correspondances avec SQLite et interroge la base **en lecture seule** :
+aucune écriture n'est jamais envoyée au serveur, et l'import d'un JSON est refusé tant
+qu'une base est connectée.
+
+- API : `POST /connect/mongodb` (`{"uri": "...", "database": "..."}`) et `DELETE /connect/mongodb`.
+- Une URI sans mot de passe est mémorisée dans `data/mongodb/connection.json` ; une URI avec
+  mot de passe reste en mémoire (à ressaisir après un redémarrage du backend).
+- Pour les champs de type date ou objectId, le LLM écrit `{"$date": "2024-01-31"}` /
+  `{"$oid": "..."}` ; DataTalk les convertit en vrais types BSON avant d'exécuter le pipeline.
+- Recommandé : se connecter avec un utilisateur MongoDB qui n'a que le rôle `read`.
+- N'utilisez pas `MONGO_URI` du `.env` pour une base existante : dans ce mode historique, un JSON
+  importé remplace les collections du même nom sur le serveur.
+
 ## API FastAPI
 
 Le backend expose une API FastAPI via `backend/main.py`.

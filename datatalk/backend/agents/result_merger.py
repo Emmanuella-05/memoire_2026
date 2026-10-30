@@ -59,13 +59,20 @@ def merge(state: dict[str, Any]) -> dict[str, Any]:
     plan = state.get("join_plan")
     if not plan:
         return _failure(state.get("join_error") or "Impossible de fusionner : aucune relation SQL ↔ MongoDB n'est disponible.")
+    if state.get("hybrid_error"):
+        return _failure(state["hybrid_error"])
+    if plan.get("decomposed"):
+        return _merge_dependent(state, plan)
     problems = []
     if state.get("sql_error"):
         problems.append(f"requête SQL : {state['sql_error']}")
     if state.get("mongo_error"):
         problems.append(f"pipeline MongoDB : {state['mongo_error']}")
     if problems:
-        return _failure("La partie hybride a échoué (" + " ; ".join(problems) + ").")
+        note = plan.get("plan_note")
+        hint = (f" La question n'a pas pu être décomposée en deux étapes ({note}) : chaque base a donc reçu la "
+                "question entière.") if note else ""
+        return _failure("La partie hybride a échoué (" + " ; ".join(problems) + ")." + hint)
 
     sql_rows = state.get("sql_results") or []
     mongo_rows = state.get("mongo_results") or []
@@ -94,6 +101,51 @@ def merge(state: dict[str, Any]) -> dict[str, Any]:
             ),
         }
     return {"rows": merged, "status": "ok", "message": None, "stats": stats}
+
+
+_LABELS = {"sql": "SQLite", "mongo": "MongoDB"}
+
+
+def _has_key(rows: list[dict[str, Any]], key: str) -> bool:
+    return any(get_path(row, key) is not None for row in rows)
+
+
+def _merge_dependent(state: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    """Plan hybride en deux étapes : la seconde source a déjà été restreinte aux identifiants de
+    la première. Son résultat EST la réponse (souvent agrégé : par ville, par catégorie...) ;
+    on ne joint en mémoire que si les deux résultats portent la clé commune."""
+    first = plan["first"]
+    second = "mongo" if first == "sql" else "sql"
+    for step, source in ((1, first), (2, second)):
+        if state.get(f"{source}_error"):
+            return _failure(
+                f"Étape {step} ({_LABELS[source]}) en échec après {state.get(f'{source}_attempts')} tentative(s) : "
+                f"{state[f'{source}_error']}"
+            )
+    first_rows = state.get(f"{first}_results") or []
+    if not first_rows or not state.get("hybrid_keys"):
+        return {"rows": [], "status": "no_data", "stats": None, "message": (
+            f"Aucune donnée {_LABELS[first]} ne correspond aux critères de la première étape "
+            f"(« {plan[f'{first}_question']} »)."
+        )}
+    second_rows = state.get(f"{second}_results") or []
+    if not second_rows:
+        return {"rows": [], "status": "no_data", "stats": None, "message": (
+            f"{len(state['hybrid_keys'])} identifiant(s) trouvé(s) côté {_LABELS[first]}, mais aucune donnée "
+            f"{_LABELS[second]} ne correspond pour la suite de la question (« {plan[f'{second}_question']} »)."
+        )}
+
+    sql_rows = state.get("sql_results") or []
+    mongo_rows = state.get("mongo_results") or []
+    if _has_key(sql_rows, plan["sqlite_key"]) and _has_key(mongo_rows, plan["mongo_key"]):
+        try:
+            merged, stats = merge_results(sql_rows, mongo_rows, plan["sqlite_key"], plan["mongo_key"],
+                                          plan.get("how", "inner"))
+        except Exception as exc:
+            return _failure(f"Erreur lors de la jointure hybride : {exc}")
+        if merged:
+            return {"rows": merged, "status": "ok", "message": None, "stats": stats}
+    return {"rows": second_rows, "status": "ok", "message": None, "stats": None}
 
 
 def _failure(message: str) -> dict[str, Any]:

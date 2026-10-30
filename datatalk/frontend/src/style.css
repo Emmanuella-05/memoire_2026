@@ -42,3 +42,8 @@ th { position: sticky; top: 0; background: #f1f3f5; }
 .trace { padding-left: 18px; } .trace li { margin: 4px 0; } code { word-break: break-all; font-size: .82rem; }
 
 @media (max-width: 700px) { .upload-grid, .catalog { grid-template-columns: 1fr; } .card { padding: 20px; } }
+
+/* Connexion à une base MongoDB existante */
+.mongo-connect { display: flex; flex-direction: column; gap: 6px; }
+.mongo-connect input[type="text"] { padding: 6px 8px; border: 1px solid #c9ced6; border-radius: 6px; font: inherit; }
+.mongo-connect small { word-break: break-word; }
