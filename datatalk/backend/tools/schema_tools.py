@@ -30,36 +30,37 @@ def _fmt(values: list[Any]) -> str:
 
 
 def describe_field(name: str, type_: str, sample_values: list[Any] | None = None,
-                   distinct_values: list[Any] | None = None) -> str:
+                   distinct_values: list[Any] | None = None, lang: str = "fr") -> str:
     base = f"{name}:{type_ or 'unknown'}"
     if _is_private(name):
         return base
     if distinct_values:
-        return f"{base} (valeurs possibles : {' | '.join(json.dumps(v, ensure_ascii=False) for v in distinct_values)})"
+        label = "possible values" if lang == "en" else "valeurs possibles"
+        return f"{base} ({label}: {' | '.join(json.dumps(v, ensure_ascii=False) for v in distinct_values)})"
     if sample_values and (type_ or "unknown").lower().split("(")[0] in _EXAMPLE_TYPES:
-        return f"{base} (ex : {_fmt(sample_values[:3])})"
+        return f"{base} ({'e.g.' if lang == 'en' else 'ex :'} {_fmt(sample_values[:3])})"
     return base
 
 
-def sql_schema_summary() -> str:
+def sql_schema_summary(lang: str = "fr") -> str:
     docs = load_database_docs("sqlite")
     lines = []
     for table in docs.get("tables", []):
         columns = ", ".join(
-            describe_field(c.get("name", ""), c.get("type", "unknown"), c.get("sample_values"), c.get("distinct_values"))
+            describe_field(c.get("name", ""), c.get("type", "unknown"), c.get("sample_values"), c.get("distinct_values"), lang)
             for c in table.get("columns", [])
         )
         lines.append(f"- {table.get('name', '')}({columns})")
-    return "\n".join(lines) if lines else "Aucune table documentée."
+    return "\n".join(lines) if lines else ("No table documented." if lang == "en" else "Aucune table documentée.")
 
 
-def mongo_schema_summary() -> str:
+def mongo_schema_summary(lang: str = "fr") -> str:
     docs = load_database_docs("mongodb")
     lines = []
     for collection in docs.get("collections", []):
         fields = ", ".join(
-            describe_field(f.get("name", ""), f.get("type", "unknown"), f.get("sample_values"), f.get("distinct_values"))
+            describe_field(f.get("name", ""), f.get("type", "unknown"), f.get("sample_values"), f.get("distinct_values"), lang)
             for f in collection.get("fields", [])
         )
         lines.append(f"- {collection.get('name', '')}({fields})")
-    return "\n".join(lines) if lines else "Aucune collection documentée."
+    return "\n".join(lines) if lines else ("No collection documented." if lang == "en" else "Aucune collection documentée.")

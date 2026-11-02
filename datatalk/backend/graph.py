@@ -34,6 +34,7 @@ class DataTalkState(TypedDict, total=False):
     join_plan: dict[str, Any] | None
     join_error: str | None
     join_stats: dict[str, Any] | None
+    translated_question: str | None
     hybrid_keys: list[Any]
     hybrid_key_count: int
     hybrid_error: str | None

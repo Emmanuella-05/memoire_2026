@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from .graph import run
-from .llm import LLMError
+from .llm import LLMError, llm_status, open_chat, open_models_enabled
 from .tools.catalog_tools import (
     BUSINESS_RULES_FILE,
     DATA_DIR,
@@ -143,6 +143,7 @@ def _workspace() -> dict[str, Any]:
         "mongodb_docs": MONGO_DOCS.exists(),
         "mongodb_engine": "server" if mongo_connection() else "embedded",
         "mongodb_connection": public_mongo_connection(),
+        **llm_status(),
         "available_sources": available_sources(),
         "mappings": MAPPINGS_FILE.exists(),
         "business_rules": BUSINESS_RULES_FILE.exists(),
@@ -242,6 +243,7 @@ def query(request: QueryRequest) -> QueryResponse:
         "join_error": state.get("join_error"),
         "join_stats": state.get("join_stats"),
         "hybrid_key_count": state.get("hybrid_key_count"),
+        "translated_question": state.get("translated_question"),
         "attempts": {
             "sql": state.get("sql_attempts"),
             "mongo": state.get("mongo_attempts"),
@@ -345,3 +347,12 @@ async def upload_business_rules(file: UploadFile = File(...)) -> dict[str, Any]:
 def claude_test() -> dict[str, Any]:
     from .llm import claude_generate
     return {"ok": True, "response": claude_generate("Réponds uniquement par OK.", max_tokens=20)}
+
+
+@app.post("/llm/test")
+def llm_test() -> dict[str, Any]:
+    """Vérifie que le serveur de modèles ouverts (Colab, Ollama...) répond."""
+    if not open_models_enabled():
+        return {"ok": False, "message": "Modèles ouverts non activés : LLM_BASE_URL n'est pas définie "
+                                         "(ou DATATALK_GENERATOR=claude) ; les requêtes sont générées par Claude.", **llm_status()}
+    return {"ok": True, "response": open_chat("Reply with OK only.", role="general", max_tokens=20), **llm_status()}

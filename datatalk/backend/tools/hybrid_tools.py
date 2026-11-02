@@ -104,6 +104,33 @@ def coerce_for_mongo(keys: list[Any], collection: str, field: str) -> list[Any]:
     return out
 
 
+# --- Étape 1 : identifiants dédoublonnés par le code, pas par le modèle ----------------------------------
+
+# Étapes qui remodèlent les documents : si le modèle en a écrit une, c'est lui qui a décidé de la forme du résultat.
+_SHAPING_STAGES = {"$group", "$count", "$facet", "$bucket", "$bucketAuto", "$sortByCount", "$replaceRoot",
+                   "$replaceWith", "$project", "$unset", "$setWindowFields", "$graphLookup", "$unionWith"}
+
+DEDUP_NOTE = ("(Note : les doublons sont éliminés automatiquement ensuite ; ne pas exiger de DISTINCT ni de "
+              "$group pour dédoublonner.)")
+
+
+def distinct_keys_pipeline(pipeline: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
+    """Ajoute, à un pipeline qui renvoie un document par enregistrement, le dédoublonnage de la clé de
+    jointure ($group puis $project). Un pipeline qui remodèle déjà les documents est laissé tel quel."""
+    if any(next(iter(stage)) in _SHAPING_STAGES for stage in pipeline):
+        return pipeline
+    return list(pipeline) + [{"$group": {"_id": f"${key}"}}, {"$project": {key: "$_id", "_id": 0}}]
+
+
+def distinct_keys_sql(sql: str, key: str) -> str:
+    """Enveloppe une requête qui n'a ni DISTINCT ni GROUP BY pour ne garder que les valeurs distinctes de la clé."""
+    sql = sql.strip().rstrip(";").strip()
+    if re.search(r"\bDISTINCT\b|\bGROUP\s+BY\b", sql, re.IGNORECASE):
+        return sql
+    column = key if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) else '"' + key.replace('"', '""') + '"'
+    return f"SELECT DISTINCT {column} FROM ({sql})"
+
+
 # --- SQL ---------------------------------------------------------------------
 
 _WITH_RE = re.compile(r"^\s*WITH\s+(RECURSIVE\s+)?", re.IGNORECASE)

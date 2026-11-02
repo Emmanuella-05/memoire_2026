@@ -35,8 +35,9 @@ Décompose la question en DEUX étapes dépendantes, chacune traitée par UNE se
 source :
 - "first" : la source interrogée en premier, celle qui contient les CONDITIONS
   qui restreignent les entités (ex. « tickets de telle catégorie », « clients de
-  telle ville »). Sa sous-question demande uniquement les identifiants distincts
-  (la clé de la correspondance choisie) des entités concernées.
+  telle ville »). Sa sous-question demande uniquement les identifiants (la clé de
+  la correspondance choisie) des entités concernées ; n'écris pas « distincts » :
+  les doublons sont éliminés automatiquement.
 - l'autre source répond ensuite au reste de la question, pour les seules entités
   sélectionnées par la première. Les identifiants lui sont fournis automatiquement :
   ne les mentionne pas et n'écris aucun identifiant dans les sous-questions.
@@ -56,13 +57,13 @@ Règles pour chaque sous-question :
 Exemple. Correspondance : 1. clients: SQLite clients(client_id) -> MongoDB incidents(client_id).
 Question : « Combien de clients par ville ont signalé un colis perdu ? »
 Réponse : {"mapping": 1, "join_type": "inner", "first": "mongo",
-"mongo_question": "Identifiants distincts (client_id) des clients ayant au moins un incident de type perdu",
+"mongo_question": "Identifiants (client_id) des clients ayant au moins un incident de type perdu",
 "sql_question": "Nombre de clients par ville, du plus grand au plus petit"}
 
 Autre exemple, dans l'ordre inverse. Correspondance : 1. produits: SQLite articles(ref) -> MongoDB retours(ref).
 Question : « Combien de retours par motif pour les articles de la catégorie jouets ? »
 Réponse : {"mapping": 1, "join_type": "inner", "first": "sql",
-"sql_question": "Références distinctes (ref) des articles de la catégorie jouets",
+"sql_question": "Références (ref) des articles de la catégorie jouets",
 "mongo_question": "Nombre de retours par motif"}
 Ici le filtre (catégorie) est dans SQLite, donc SQLite passe en premier.
 

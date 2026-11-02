@@ -16,17 +16,64 @@ Pipeline par tentative (3 au maximum) :
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
-from ..llm import LLMError, claude_json
-from ..tools.catalog_tools import DataSourceUnavailable, get_path, load_database_docs
-from ..tools.hybrid_tools import coerce_for_mongo, display_pipeline, with_selected_keys
-from ..tools.schema_tools import mongo_schema_summary
+from ..llm import LLMError, claude_json, fix_with_open_models, open_chat, open_models_enabled
+from ..tools.catalog_tools import DataSourceUnavailable, get_path, load_database_docs, mongo_connection
+from ..tools.hybrid_tools import DEDUP_NOTE, coerce_for_mongo, display_pipeline, distinct_keys_pipeline, with_selected_keys
+from ..tools.mongo_fields import pipeline_field_issues
+from ..tools.mongo_normalizer import normalize_mongo_output
 from ..tools.mongo_tools import collection_rejection_reason, execute_mongo, pipeline_rejection_reason
 from ..tools.rag_tools import context as rag_context
+from ..tools.schema_tools import mongo_schema_summary
+from ..tools.translate_tools import to_english, translate_context_enabled
 
 MAX_ATTEMPTS = 3
 _INFRA_ERRORS = (LLMError, DataSourceUnavailable)
+
+# --- Modèles ouverts (Qwen2.5-Coder) : le modèle écrit une commande mongosh naturelle pour lui ; le
+# convertisseur (tools/mongo_normalizer.py) en tire (collection, pipeline), même si la sortie est incomplète
+# (filtre seul, étape seule, `find` absent, syntaxe JavaScript...). Les contrôles déterministes
+# (collection connue, opérateurs interdits, champs existants) s'appliquent ensuite.
+OPEN_GENERATE_SYSTEM_PROMPT = """You are the MongoDB query agent of DataTalk.
+You receive the MongoDB collections (fields with types and exact possible values), optional business rules, and a question.
+Write ONE read-only MongoDB command that answers it, in mongosh syntax:
+  db.<collection>.find(<filter>, <projection>).sort(...).limit(...)
+  db.<collection>.aggregate([ <stages> ])
+Rules:
+- ALWAYS start with db.<collection>. and use ONLY collections and fields listed in the schema.
+- Use aggregate() for grouping, counting, averages, joins ($lookup) and any computed result; find() for simple filters.
+- Each pipeline stage contains exactly one operator. Never use $out, $merge, $function, $accumulator or $where.
+- For fields with listed possible values, use those values exactly as written.
+- Fields of type date or objectId are compared with extended JSON: {"$date": "2024-01-31"} or {"$oid": "<24 hex chars>"}.
+Reply with ONLY the command inside one ```javascript code block, nothing else.
+
+Examples:
+Question: customers living in Paris
+```javascript
+db.customers.find({"city": "Paris"})
+```
+Question: number of orders per customer, highest first
+```javascript
+db.orders.aggregate([{"$group": {"_id": "$customer_id", "n": {"$sum": 1}}}, {"$sort": {"n": -1}}])
+```"""
+
+OPEN_FIX_PROMPT_TEMPLATE = """MongoDB schema:
+{schema}
+
+Business rules:
+{rules}
+
+Question: {question}
+
+This command was rejected:
+db.{collection}.aggregate({pipeline})
+
+Reason:
+{issue}
+{requirement}
+Write the corrected command (same format: only one ```javascript code block)."""
 
 GENERATE_SYSTEM_PROMPT = """Tu es l'agent MongoDB de DataTalk.
 Tu reçois le schéma inféré des collections MongoDB disponibles, du contexte
@@ -91,10 +138,12 @@ def _join_requirement(join_plan: dict[str, Any] | None, step: str | None = None)
         return ""
     if step == "first":
         return (
-            "\n\nÉtape 1 d'une question hybride : retourne UNIQUEMENT les identifiants DISTINCTS du champ "
-            f"'{join_plan.get('mongo_key')}' (collection {join_plan.get('mongo_collection')}) des documents qui "
-            f"répondent à la question, sans agrégation. Par exemple : $match, puis $group sur ce champ, puis "
-            f"$project pour renvoyer '{join_plan.get('mongo_key')}' à la racine."
+            f"\n\nÉtape 1 d'une question hybride : retourne, pour les documents de la collection "
+            f"{join_plan.get('mongo_collection')} qui répondent à la question, le champ '{join_plan.get('mongo_key')}' "
+            "à la racine du résultat. Les doublons sont éliminés automatiquement : n'ajoute pas de $group pour "
+            "dédoublonner. Si la condition porte sur un calcul par entité (moyenne, somme, nombre), fais ce calcul "
+            f"avec $group sur '{join_plan.get('mongo_key')}', filtre dessus, puis $project pour renvoyer "
+            f"'{join_plan.get('mongo_key')}' à la racine."
         )
     if step == "second":
         return (
@@ -116,8 +165,53 @@ def _read_pipeline(parsed: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     return collection, pipeline
 
 
+def _fields_by_collection() -> dict[str, list[str]]:
+    return {
+        c["name"]: [f.get("name", "") for f in c.get("fields", []) if f.get("name")]
+        for c in load_database_docs("mongodb").get("collections", []) if c.get("name")
+    }
+
+
+def _open_requirement(join_plan: dict[str, Any] | None, step: str | None) -> str:
+    if not join_plan:
+        return ""
+    collection, key = join_plan.get("mongo_collection"), join_plan.get("mongo_key")
+    if step == "first":
+        return (f"\n\nStep 1 of a cross-database question: for the documents of collection {collection} that answer the "
+                f"question, return field '{key}' at the root of the result. Duplicates are removed automatically: do NOT add "
+                f"a $group just to deduplicate. If the condition depends on a per-entity computation (average, sum, count), "
+                f"compute it with $group on '{key}', filter on it, then $project to return '{key}' at the root.")
+    if step == "second":
+        return (f"\n\nStep 2 of a cross-database question: use collection '{collection}'. A filter on field '{key}' "
+                "(identifiers already selected by the previous step) is applied AUTOMATICALLY before your pipeline: "
+                "do not write that filter and never write identifiers.")
+    return (f"\n\nThis result will be joined to SQLite: it MUST return, without aggregating it, the field '{key}' "
+            f"(collection {collection}).")
+
+
+def _open_rules(question: str) -> str:
+    ctx = rag_context(question, database="mongodb")
+    if ctx.strip() and translate_context_enabled():
+        ctx = to_english(ctx)
+    return ctx.strip() or "(none)"
+
+
+def _convert(raw: str, join_plan: dict[str, Any] | None) -> tuple[str, list[dict[str, Any]]]:
+    """Commande brute du modèle -> (collection, pipeline). Lève ValueError si inexploitable (=> correction)."""
+    default = join_plan.get("mongo_collection") if join_plan else None
+    return normalize_mongo_output(raw, _known_collections(), default, _fields_by_collection(),
+                                  extended_json=mongo_connection() is not None)
+
+
 def generate_pipeline(question: str, join_plan: dict[str, Any] | None = None,
                       step: str | None = None) -> tuple[str, list[dict[str, Any]]]:
+    if open_models_enabled():
+        prompt = (
+            f"MongoDB schema:\n{mongo_schema_summary('en')}\n\n"
+            f"Business rules:\n{_open_rules(question)}\n\n"
+            f"Question: {to_english(question)}{_open_requirement(join_plan, step)}"
+        )
+        return _convert(open_chat(prompt, system=OPEN_GENERATE_SYSTEM_PROMPT, role="mongo", max_tokens=700), join_plan)
     prompt = (
         f"Schéma MongoDB:\n{_schema_summary()}\n\n"
         f"Contexte documentaire:\n{rag_context(question, database='mongodb')}\n\n"
@@ -129,6 +223,13 @@ def generate_pipeline(question: str, join_plan: dict[str, Any] | None = None,
 def fix_pipeline(question: str, collection: str, pipeline: list[dict[str, Any]], issue: str,
                  join_plan: dict[str, Any] | None = None,
                  step: str | None = None) -> tuple[str, list[dict[str, Any]]]:
+    if fix_with_open_models():
+        prompt = OPEN_FIX_PROMPT_TEMPLATE.format(
+            schema=mongo_schema_summary("en"), rules=_open_rules(question), question=to_english(question),
+            collection=collection, pipeline=json.dumps(pipeline, ensure_ascii=False, default=str), issue=issue,
+            requirement=_open_requirement(join_plan, step),
+        )
+        return _convert(open_chat(prompt, system=OPEN_GENERATE_SYSTEM_PROMPT, role="mongo", max_tokens=700), join_plan)
     prompt = FIX_PROMPT_TEMPLATE.format(
         schema=_schema_summary(), question=question, collection=collection,
         pipeline=json.dumps(pipeline, ensure_ascii=False, default=str), issue=issue,
@@ -138,18 +239,21 @@ def fix_pipeline(question: str, collection: str, pipeline: list[dict[str, Any]],
 
 
 def validate_pipeline(question: str, collection: str, pipeline: list[dict[str, Any]],
-                      executable: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                      executable: list[dict[str, Any]] | None = None, note: str | None = None) -> dict[str, Any]:
     """Validation en deux temps : déterministe (collection connue, aucun
     opérateur interdit) puis sémantique (LLM). `executable` est le pipeline réellement
     exécuté (avec le filtre sur les identifiants) quand il diffère de celui du modèle."""
     known = _known_collections()
     reason = collection_rejection_reason(collection, known) or pipeline_rejection_reason(executable or pipeline, known)
+    if not reason and open_models_enabled() and os.getenv("DATATALK_MONGO_FIELD_CHECK", "1").strip().lower() not in ("0", "false", "off", "no"):
+        # Un petit modèle invente des champs ; MongoDB, lui, renvoie alors zéro résultat sans rien dire.
+        reason = pipeline_field_issues(collection, pipeline, _fields_by_collection())
     if reason:
         return {"valid": False, "issues": reason}
 
-    note = f"\n{SELECTED_KEYS_NOTE}" if executable else ""
+    note_text = f"\n{note}" if note else ""
     prompt = (
-        f"Schéma MongoDB:\n{_schema_summary()}\n\nQuestion: {question}{note}\n\n"
+        f"Schéma MongoDB:\n{_schema_summary()}\n\nQuestion: {question}{note_text}\n\n"
         f"Collection: {collection}\nPipeline: {json.dumps(pipeline, ensure_ascii=False, default=str)}"
     )
     try:
@@ -177,6 +281,8 @@ def run(question: str, join_plan: dict[str, Any] | None = None, injected_keys: l
     keys: list[Any] = []
     if step == "second":
         keys = coerce_for_mongo(injected_keys or [], join_plan["mongo_collection"], join_plan["mongo_key"])
+    translated = to_english(question)       # identique à `question` si les modèles ouverts ne sont pas utilisés
+    translated_question = translated if translated != question else None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             current = (
@@ -194,9 +300,15 @@ def run(question: str, join_plan: dict[str, Any] | None = None, injected_keys: l
             issue = (f"Utilise la collection '{join_plan['mongo_collection']}' : c'est elle qui porte la clé de "
                      f"jointure '{join_plan['mongo_key']}' sur laquelle les identifiants sont filtrés.")
             continue
-        executable = with_selected_keys(pipeline, join_plan["mongo_key"], keys) if step == "second" else None
+        executable = None
+        note = None
+        if step == "second":
+            executable, note = with_selected_keys(pipeline, join_plan["mongo_key"], keys), SELECTED_KEYS_NOTE
+        elif step == "first":
+            deduplicated = distinct_keys_pipeline(pipeline, join_plan["mongo_key"])
+            executable, note = (deduplicated if deduplicated != pipeline else None), DEDUP_NOTE
 
-        validation = validate_pipeline(question, collection, pipeline, executable)
+        validation = validate_pipeline(question, collection, pipeline, executable, note)
         if not validation["valid"]:
             issue = validation["issues"]
             continue
@@ -220,6 +332,7 @@ def run(question: str, join_plan: dict[str, Any] | None = None, injected_keys: l
             "mongo_results": rows,
             "mongo_error": None,
             "mongo_attempts": attempt,
+            "translated_question": translated_question,
         }
 
     return {
@@ -229,6 +342,7 @@ def run(question: str, join_plan: dict[str, Any] | None = None, injected_keys: l
         "mongo_results": [],
         "mongo_error": issue,
         "mongo_attempts": MAX_ATTEMPTS,
+        "translated_question": translated_question,
     }
 
 

@@ -217,6 +217,7 @@ function Trace({ execution, source }) {
             <b>Jointure :</b> {join_plan.sqlite_table}.{join_plan.sqlite_key} ↔ {join_plan.mongo_collection}.{join_plan.mongo_key} ({join_plan.how})
           </li>
         )}
+        {execution.translated_question && <li><b>Question traduite pour les modèles ouverts :</b> {execution.translated_question}</li>}
         {join_plan?.decomposed && (
           <li>
             <b>Plan en deux étapes :</b>
@@ -339,7 +340,7 @@ function App() {
   }
 
   const status = workspace
-    ? `MongoDB : ${workspace.mongodb_connection ? `serveur ${workspace.mongodb_connection.database}` : "moteur embarqué"} · RAG : ${workspace.rag_documents ?? "?"} documents indexés${workspace.claude_configured ? "" : " · clé Claude absente"}`
+    ? `MongoDB : ${workspace.mongodb_connection ? `serveur ${workspace.mongodb_connection.database}` : "moteur embarqué"} · RAG : ${workspace.rag_documents ?? "?"} documents indexés${workspace.generation === "open" ? " · requêtes générées par des modèles ouverts" : workspace.claude_configured ? "" : " · clé Claude absente"}`
     : "Connexion au workspace…";
 
   return (
